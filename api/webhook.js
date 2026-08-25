@@ -6,7 +6,16 @@ const { uploadFromUrl } = require('../lib/cloudinary');
 const { saveCleanUrl } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 
-const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+// webhookReply:false — por default Telegraf manda la PRIMERA respuesta
+// saliente de cada update (acá, el editMessageText de la confirmación)
+// empaquetada en el body de la respuesta HTTP del webhook, en vez de como
+// llamada real a la API de Telegram. En Vercel, apenas esa respuesta HTTP
+// se cierra, la ejecución se corta — así que todo lo que viene después en el
+// mismo handler (subir a Cloudinary, commitear a GitHub, en finalize())
+// quedaba truncado a mitad de camino, sin tirar ningún error. Con esto,
+// todas las llamadas salen por HTTP real y el handler no termina hasta que
+// awaitemos todo, como corresponde.
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, { telegram: { webhookReply: false } });
 const ALLOWED_ID = String(process.env.ALLOWED_TELEGRAM_ID || '');
 
 // Frases que dicen "esta foto no tiene país" (ej. Modelos) — todo normalizado
