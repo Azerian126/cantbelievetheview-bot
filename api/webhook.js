@@ -1,4 +1,4 @@
-const { Telegraf } = require('telegraf');
+const { Telegraf, Markup } = require('telegraf');
 const { getSession, setSession, clearSession } = require('../lib/session');
 const { mainMenu, countryPage, categoryMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
@@ -7,6 +7,14 @@ const { saveCleanUrl } = require('../lib/photoStore');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const ALLOWED_ID = String(process.env.ALLOWED_TELEGRAM_ID || '');
+
+// Teclado nativo de Telegram para compartir ubicación con un toque — así la
+// coordenada que queda en data.json es la real (la del GPS de tu teléfono al
+// sacar la foto, o la que elijas a mano en el mapa), no una inventada.
+const locationKeyboard = Markup.keyboard([
+  [Markup.button.locationRequest('📍 Compartir ubicación')],
+  ['Sin ubicación'],
+]).resize().oneTime();
 
 // --- seguridad: solo Mario puede usar este bot -----------------------------
 bot.use(async (ctx, next) => {
@@ -97,24 +105,24 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_caption') {
     session.caption = text;
-    if (session.target.type === 'country_new') {
-      session.step = 'await_desc_es';
-      await setSession(chatId, session);
-      return ctx.reply(
-        'Este país todavía no tiene galería — necesito una descripción corta de intro, en español ' +
-          '(ej: "Andes, niebla y ruinas incas al amanecer.").'
-      );
-    }
-    session.step = 'finalize';
+    session.step = 'await_location';
     await setSession(chatId, session);
-    return finalize(ctx, session);
+    return ctx.reply(
+      '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación (elegís el punto en el mapa ' +
+        'de Telegram), o mandá "Sin ubicación" si no la tenés.',
+      locationKeyboard
+    );
+  }
+
+  if (session.step === 'await_location' && text === 'Sin ubicación') {
+    return afterLocation(ctx, session);
   }
 
   if (session.step === 'await_desc_es') {
     session.descEs = text;
     session.step = 'await_desc_en';
     await setSession(chatId, session);
-    return ctx.reply('Ahora la misma descripción en inglés (o mandá "-" para dejarla igual).');
+    return ctx.reply('Ahora la misma descripción en inglés (o mandá "-" para dejarla igual).', Markup.removeKeyboard());
   }
 
   if (session.step === 'await_desc_en') {
@@ -124,6 +132,39 @@ bot.on('text', async (ctx) => {
     return finalize(ctx, session);
   }
 });
+
+// --- ubicación (respuesta al paso "await_location") --------------------------
+bot.on('location', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const session = await getSession(chatId);
+  if (!session || session.step !== 'await_location') return;
+
+  session.lat = ctx.message.location.latitude;
+  session.lng = ctx.message.location.longitude;
+  return afterLocation(ctx, session);
+});
+
+// Después de la ubicación (compartida o saltada), sigue el flujo normal:
+// si es un país nuevo pide la descripción de intro, si no, finaliza directo.
+async function afterLocation(ctx, session) {
+  const chatId = ctx.chat.id;
+  if (session.target.type === 'country_new') {
+    session.step = 'await_desc_es';
+    await setSession(chatId, session);
+    return ctx.reply(
+      'Este país todavía no tiene galería — necesito una descripción corta de intro, en español ' +
+        '(ej: "Andes, niebla y ruinas incas al amanecer.").',
+      Markup.removeKeyboard()
+    );
+  }
+  session.step = 'finalize';
+  await setSession(chatId, session);
+  await ctx.reply(
+    session.lat !== undefined ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.',
+    Markup.removeKeyboard()
+  );
+  return finalize(ctx, session);
+}
 
 // --- 4. subir la foto y commitear data.json ------------------------------------
 async function finalize(ctx, session) {
@@ -141,6 +182,15 @@ async function finalize(ctx, session) {
     // versión con marca de agua.
     await saveCleanUrl(photoId, cleanUrl);
 
+    // Solo le agregamos lat/lng a la foto si de verdad la compartiste — así
+    // el sitio sabe que es una coordenada real (si no, la galería se la
+    // inventa aproximada a partir del país/categoría, como venía haciendo).
+    const photoEntry = { id: photoId, displayUrl, caption: session.caption };
+    if (session.lat !== undefined) {
+      photoEntry.lat = session.lat;
+      photoEntry.lng = session.lng;
+    }
+
     const { json: siteData, sha } = await getSiteData();
     let label = '';
 
@@ -148,13 +198,13 @@ async function finalize(ctx, session) {
       const cat = siteData.categories.find((c) => c.key === session.target.key);
       if (!cat) throw new Error(`No encontré la categoría "${session.target.key}" en data.json`);
       cat.photos = cat.photos || [];
-      cat.photos.push({ id: photoId, displayUrl, caption: session.caption });
+      cat.photos.push(photoEntry);
       label = cat.name;
     } else if (session.target.type === 'country_existing') {
       const c = siteData.visited.find((x) => x.key === session.target.key);
       if (!c) throw new Error(`No encontré el país "${session.target.key}" en visited`);
       c.photos = c.photos || [];
-      c.photos.push({ id: photoId, displayUrl, caption: session.caption });
+      c.photos.push(photoEntry);
       label = c.name;
     } else if (session.target.type === 'country_new') {
       const idx = siteData.visitedEmpty.findIndex((x) => x.key === session.target.key);
@@ -169,7 +219,7 @@ async function finalize(ctx, session) {
         h: c.h,
         desc: session.descEs,
         descEn: session.descEn,
-        photos: [{ id: photoId, displayUrl, caption: session.caption }],
+        photos: [photoEntry],
       });
       label = c.name;
     }
