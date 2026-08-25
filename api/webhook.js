@@ -1,12 +1,17 @@
 const { Telegraf, Markup } = require('telegraf');
 const { getSession, setSession, clearSession } = require('../lib/session');
-const { mainMenu, countryPage, categoryMenu, categoryTagMenu } = require('../lib/keyboards');
+const { categoryMenu, categoryTagMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl } = require('../lib/cloudinary');
 const { saveCleanUrl } = require('../lib/photoStore');
+const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const ALLOWED_ID = String(process.env.ALLOWED_TELEGRAM_ID || '');
+
+// Frases que dicen "esta foto no tiene país" (ej. Modelos) — todo normalizado
+// (sin acentos, minúscula) porque se compara contra normalize(texto del usuario).
+const NO_COUNTRY_WORDS = ['sin ubicacion', 'ninguno', 'ninguna', 'no', 'n/a', 'na'];
 
 // Teclado nativo de Telegram para compartir ubicación con un toque — así la
 // coordenada que queda en data.json es la real (la del GPS de tu teléfono al
@@ -28,17 +33,19 @@ bot.use(async (ctx, next) => {
 
 bot.start((ctx) =>
   ctx.reply(
-    'Mandame una foto y te pregunto a qué país o categoría del sitio pertenece. ' +
+    'Mandame una foto y te pregunto de qué país es (o "sin ubicación" si no aplica, ej. Modelos). ' +
       'En un rato queda publicada en cantbelievetheview.com.'
   )
 );
 
 // --- 1. llega una foto -------------------------------------------------------
+// Casi toda foto tiene país (es lo único que preguntamos de entrada). El caso
+// sin ubicación (ej. Modelos) es la excepción, no la alternativa por defecto.
 bot.on('photo', async (ctx) => {
   const photos = ctx.message.photo;
   const best = photos[photos.length - 1]; // la de mayor resolución
-  await setSession(ctx.chat.id, { step: 'await_target', fileId: best.file_id });
-  await ctx.reply('¿A qué corresponde esta foto?', { reply_markup: mainMenu });
+  await setSession(ctx.chat.id, { step: 'await_country', fileId: best.file_id });
+  await ctx.reply('¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).');
 });
 
 // --- 2. botones ---------------------------------------------------------------
@@ -60,57 +67,90 @@ bot.on('callback_query', async (ctx) => {
     return ctx.editMessageText('Esta conversación ya expiró — mandame la foto de nuevo.');
   }
 
-  if (data === 'menu:main') {
-    await ctx.answerCbQuery();
-    return ctx.editMessageText('¿A qué corresponde esta foto?', { reply_markup: mainMenu });
-  }
-
-  if (data.startsWith('menu:country:')) {
-    const page = parseInt(data.split(':')[2], 10) || 0;
+  // Confirmación de un país ambiguo (varios candidatos parecidos al texto).
+  if (data.startsWith('country:')) {
+    const key = data.slice('country:'.length);
     await ctx.answerCbQuery();
     const { json: siteData } = await getSiteData();
-    return ctx.editMessageText('Elegí el país:', { reply_markup: countryPage(siteData, page) });
-  }
-
-  if (data === 'menu:category') {
-    await ctx.answerCbQuery();
-    const { json: siteData } = await getSiteData();
-    return ctx.editMessageText('Elegí la categoría:', { reply_markup: categoryMenu(siteData) });
-  }
-
-  if (data.startsWith('sel:c:') || data.startsWith('sel:g:')) {
-    const [, kind, key] = data.split(':');
-    await ctx.answerCbQuery();
-
-    if (kind === 'c') {
-      const { json: siteData } = await getSiteData();
-      const isNew = siteData.visitedEmpty.some((c) => c.key === key);
-      const target = { type: isNew ? 'country_new' : 'country_existing', key };
-      await setSession(chatId, { ...session, step: 'await_caption', target });
-    } else {
-      await setSession(chatId, { ...session, step: 'await_caption', target: { type: 'category', key } });
-    }
-
+    const isNew = siteData.visitedEmpty.some((c) => c.key === key);
+    session.target = { type: isNew ? 'country_new' : 'country_existing', key };
+    session.step = 'await_caption';
+    await setSession(chatId, session);
     return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
   }
 
+  // Elegir categoría cuando la foto no tiene país (ej. Modelos).
+  if (data.startsWith('sel:g:')) {
+    const key = data.slice('sel:g:'.length);
+    await ctx.answerCbQuery();
+    session.target = { type: 'category', key };
+    session.step = 'await_caption';
+    await setSession(chatId, session);
+    return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
+  }
+
+  // Tag opcional de categoría temática para una foto que SÍ tiene país.
   if (data.startsWith('tag:g:') || data === 'tag:none') {
     await ctx.answerCbQuery();
-    session.categoryKey = data === 'tag:none' ? null : data.split(':')[2];
+    session.categoryKey = data === 'tag:none' ? null : data.slice('tag:g:'.length);
     session.step = 'finalize';
     await setSession(chatId, session);
     await ctx.editMessageText(session.categoryKey ? 'Categoría marcada.' : 'Sin categoría temática.');
     return finalize(ctx, session);
   }
+
+  return ctx.answerCbQuery();
 });
 
 // --- 3. texto (respuestas a las preguntas del flujo) --------------------------
 bot.on('text', async (ctx) => {
   const chatId = ctx.chat.id;
   const session = await getSession(chatId);
-  if (!session || !session.step || session.step === 'await_target') return; // no está en medio de un flujo
+  if (!session || !session.step) return; // no está en medio de un flujo
 
   const text = ctx.message.text.trim();
+
+  if (session.step === 'await_country') {
+    const { json: siteData } = await getSiteData();
+    const norm = normalize(text);
+
+    // 1) dijo explícitamente que no tiene país (ej. "sin ubicación")
+    if (NO_COUNTRY_WORDS.includes(norm)) {
+      session.step = 'await_no_country_category';
+      await setSession(chatId, session);
+      return ctx.reply('¿A qué categoría pertenece?', { reply_markup: categoryMenu(siteData) });
+    }
+
+    // 2) escribió directamente el nombre de una categoría (ej. "modelos") —
+    //    equivale a "sin país" + esa categoría, en un solo paso.
+    const catMatch = findCategoryMatch(siteData, text);
+    if (catMatch) {
+      session.target = { type: 'category', key: catMatch.key };
+      session.step = 'await_caption';
+      await setSession(chatId, session);
+      return ctx.reply(
+        `Categoría: ${catMatch.name} ✅ (sin país)\nMandame el título / descripción corta de la foto (en español).`
+      );
+    }
+
+    // 3) nombre de país, tolerando errores de tipeo/acentos.
+    const matches = findCountryMatches(siteData, text);
+    if (matches.length === 0) {
+      return ctx.reply(
+        `No encontré "${text}" ni como país ni como categoría — revisá cómo lo escribiste y probá de nuevo ` +
+          '(o mandá "sin ubicación" si no aplica).'
+      );
+    }
+    if (matches.length === 1 && matches[0].distance === 0) {
+      session.target = { type: matches[0].isNew ? 'country_new' : 'country_existing', key: matches[0].key };
+      session.step = 'await_caption';
+      await setSession(chatId, session);
+      return ctx.reply(`País: ${matches[0].name} ✅\nMandame el título / descripción corta de la foto (en español).`);
+    }
+    const rows = matches.map((m) => [{ text: `${m.isNew ? '⚪' : '🟡'} ${m.name}`, callback_data: `country:${m.key}` }]);
+    rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
+    return ctx.reply(`¿A cuál país te referís con "${text}"?`, { reply_markup: { inline_keyboard: rows } });
+  }
 
   if (session.step === 'await_caption') {
     session.caption = text;
