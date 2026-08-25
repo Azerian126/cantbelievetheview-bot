@@ -1,6 +1,6 @@
 const { Telegraf, Markup } = require('telegraf');
 const { getSession, setSession, clearSession } = require('../lib/session');
-const { mainMenu, countryPage, categoryMenu } = require('../lib/keyboards');
+const { mainMenu, countryPage, categoryMenu, categoryTagMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl } = require('../lib/cloudinary');
 const { saveCleanUrl } = require('../lib/photoStore');
@@ -93,6 +93,15 @@ bot.on('callback_query', async (ctx) => {
 
     return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
   }
+
+  if (data.startsWith('tag:g:') || data === 'tag:none') {
+    await ctx.answerCbQuery();
+    session.categoryKey = data === 'tag:none' ? null : data.split(':')[2];
+    session.step = 'finalize';
+    await setSession(chatId, session);
+    await ctx.editMessageText(session.categoryKey ? 'Categoría marcada.' : 'Sin categoría temática.');
+    return finalize(ctx, session);
+  }
 });
 
 // --- 3. texto (respuestas a las preguntas del flujo) --------------------------
@@ -127,9 +136,8 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_desc_en') {
     session.descEn = text === '-' ? session.descEs : text;
-    session.step = 'finalize';
     await setSession(chatId, session);
-    return finalize(ctx, session);
+    return askCategoryTag(ctx, session);
   }
 });
 
@@ -145,7 +153,10 @@ bot.on('location', async (ctx) => {
 });
 
 // Después de la ubicación (compartida o saltada), sigue el flujo normal:
-// si es un país nuevo pide la descripción de intro, si no, finaliza directo.
+// - país nuevo: pide la descripción de intro, y después la categoría (opcional).
+// - país existente: pregunta directo la categoría (opcional).
+// - sin país (ej. Modelos): finaliza directo, no aplica el tag de categoría
+//   porque ya está implícito en la categoría elegida al principio.
 async function afterLocation(ctx, session) {
   const chatId = ctx.chat.id;
   if (session.target.type === 'country_new') {
@@ -157,13 +168,28 @@ async function afterLocation(ctx, session) {
       Markup.removeKeyboard()
     );
   }
-  session.step = 'finalize';
-  await setSession(chatId, session);
   await ctx.reply(
     session.lat !== undefined ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.',
     Markup.removeKeyboard()
   );
+  if (session.target.type === 'country_existing') {
+    return askCategoryTag(ctx, session);
+  }
+  session.step = 'finalize';
+  await setSession(chatId, session);
   return finalize(ctx, session);
+}
+
+// Casi toda foto de un país puede pertenecer ADEMÁS a una categoría temática
+// (no es alternativa a tener país — es un tag extra, opcional).
+async function askCategoryTag(ctx, session) {
+  const chatId = ctx.chat.id;
+  session.step = 'await_category_tag';
+  await setSession(chatId, session);
+  const { json: siteData } = await getSiteData();
+  return ctx.reply('¿Pertenece también a alguna categoría temática del sitio? (opcional)', {
+    reply_markup: categoryTagMenu(siteData),
+  });
 }
 
 // --- 4. subir la foto y commitear data.json ------------------------------------
@@ -189,6 +215,14 @@ async function finalize(ctx, session) {
     if (session.lat !== undefined) {
       photoEntry.lat = session.lat;
       photoEntry.lng = session.lng;
+    }
+    // Tag opcional de categoría temática — solo aplica a fotos de país (la
+    // rama "category" de abajo, ej. Modelos, ya está tagueada por estar bajo
+    // esa categoría directamente). La galería de la categoría en el sitio
+    // suma esta foto sin duplicarla en data.json (ver photosForCategory en
+    // index.html).
+    if (session.categoryKey) {
+      photoEntry.categoryKey = session.categoryKey;
     }
 
     const { json: siteData, sha } = await getSiteData();
@@ -224,12 +258,17 @@ async function finalize(ctx, session) {
       label = c.name;
     }
 
-    const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${session.caption} — ${label}`;
+    const tagCat = photoEntry.categoryKey
+      ? siteData.categories.find((c) => c.key === photoEntry.categoryKey)
+      : null;
+    const fullLabel = tagCat ? `${label} + ${tagCat.name}` : label;
+
+    const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${session.caption} — ${fullLabel}`;
     await commitSiteData(siteData, sha, message);
 
     await clearSession(chatId);
     await ctx.reply(
-      `✅ Listo — "${session.caption}" agregada a ${label}.\n` +
+      `✅ Listo — "${session.caption}" agregada a ${fullLabel}.\n` +
         `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.`
     );
   } catch (err) {
