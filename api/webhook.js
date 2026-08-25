@@ -163,8 +163,16 @@ bot.on('text', async (ctx) => {
     );
   }
 
-  if (session.step === 'await_location' && text === 'Sin ubicación') {
-    return afterLocation(ctx, session);
+  if (session.step === 'await_location') {
+    if (text === 'Sin ubicación') return afterLocation(ctx, session);
+    // Este paso solo entiende el botón de GPS o "Sin ubicación" — cualquier
+    // otro texto (ej. una descripción del lugar) antes se descartaba en
+    // silencio, dejando la sensación de que el bot no respondía.
+    return ctx.reply(
+      'Para la ubicación tocá "📍 Compartir ubicación" (elegís el punto en el mapa de Telegram) o mandá ' +
+        '"Sin ubicación" si no la tenés — ese texto no lo puedo usar como coordenada.',
+      locationKeyboard
+    );
   }
 
   if (session.step === 'await_desc_es') {
