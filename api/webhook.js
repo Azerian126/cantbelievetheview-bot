@@ -3,6 +3,7 @@ const { getSession, setSession, clearSession } = require('../lib/session');
 const { mainMenu, countryPage, categoryMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl } = require('../lib/cloudinary');
+const { saveCleanUrl } = require('../lib/photoStore');
 
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const ALLOWED_ID = String(process.env.ALLOWED_TELEGRAM_ID || '');
@@ -132,7 +133,13 @@ async function finalize(ctx, session) {
 
     const fileLink = await ctx.telegram.getFileLink(session.fileId);
     const publicIdHint = `${session.target.key}-${Date.now()}`;
-    const url = await uploadFromUrl(fileLink.href, publicIdHint);
+    const { cleanUrl, displayUrl } = await uploadFromUrl(fileLink.href, publicIdHint);
+    const photoId = publicIdHint;
+
+    // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
+    // data.json, que es público. data.json solo se entera del id y de la
+    // versión con marca de agua.
+    await saveCleanUrl(photoId, cleanUrl);
 
     const { json: siteData, sha } = await getSiteData();
     let label = '';
@@ -141,13 +148,13 @@ async function finalize(ctx, session) {
       const cat = siteData.categories.find((c) => c.key === session.target.key);
       if (!cat) throw new Error(`No encontré la categoría "${session.target.key}" en data.json`);
       cat.photos = cat.photos || [];
-      cat.photos.push({ url, caption: session.caption });
+      cat.photos.push({ id: photoId, displayUrl, caption: session.caption });
       label = cat.name;
     } else if (session.target.type === 'country_existing') {
       const c = siteData.visited.find((x) => x.key === session.target.key);
       if (!c) throw new Error(`No encontré el país "${session.target.key}" en visited`);
       c.photos = c.photos || [];
-      c.photos.push({ url, caption: session.caption });
+      c.photos.push({ id: photoId, displayUrl, caption: session.caption });
       label = c.name;
     } else if (session.target.type === 'country_new') {
       const idx = siteData.visitedEmpty.findIndex((x) => x.key === session.target.key);
@@ -162,7 +169,7 @@ async function finalize(ctx, session) {
         h: c.h,
         desc: session.descEs,
         descEn: session.descEn,
-        photos: [{ url, caption: session.caption }],
+        photos: [{ id: photoId, displayUrl, caption: session.caption }],
       });
       label = c.name;
     }
