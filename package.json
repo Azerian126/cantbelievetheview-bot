@@ -5,7 +5,7 @@
   "description": "Bot de Telegram para subir fotos a cantbelievetheview.com sin tocar código.",
   "main": "api/webhook.js",
   "engines": {
-    "node": "20.x"
+    "node": "24.x"
   },
   "scripts": {
     "set-webhook": "node scripts/set-webhook.js",
