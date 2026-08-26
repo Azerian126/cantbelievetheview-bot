@@ -688,6 +688,18 @@ bot.on('callback_query', async (ctx) => {
     return ctx.reply(askCountryText);
   }
 
+  // Ninguna de las opciones de geocoding matcheaba — no es un cancelar
+  // general, solo volver a pedir el nombre del lugar sin tocar el resto
+  // de la sesión (foto, país, título ya elegidos siguen en pie).
+  if (data === 'loc:retry') {
+    delete session.pendingPlaces;
+    session.step = 'await_location';
+    await setSession(chatId, session);
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('Ok, probemos de nuevo.');
+    return ctx.reply(locationPrompt, locationKeyboard);
+  }
+
   // Eligió una de las opciones de lugar que encontró el geocoding.
   if (data.startsWith('loc:')) {
     const idx = parseInt(data.slice('loc:'.length), 10);
@@ -864,7 +876,9 @@ bot.on('text', async (ctx) => {
       session.pendingPlaces = places;
       await setSession(chatId, session);
       const rows = places.map((p, i) => [{ text: shortenPlace(p.displayName), callback_data: `loc:${i}` }]);
-      rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
+      // "Ninguna de estas" en vez de 'cancel' — no querés perder la foto y el
+      // país que ya elegiste solo porque el lugar no matcheó bien.
+      rows.push([{ text: '✖️ Ninguna de estas', callback_data: 'loc:retry' }]);
       return ctx.reply(`¿Cuál de estos es "${text}"?`, { reply_markup: { inline_keyboard: rows } });
     } catch (err) {
       console.error('Error geocodificando:', err);
