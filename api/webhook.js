@@ -3,7 +3,15 @@ const { getSession, setSession, clearSession } = require('../lib/session');
 const { categoryMenu, categoryTagMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl, downloadBuffer, hashBuffer } = require('../lib/cloudinary');
-const { saveCleanUrl, findByHash, saveHash } = require('../lib/photoStore');
+const {
+  saveCleanUrl,
+  findByHash,
+  saveHash,
+  deleteHash,
+  saveLastUpload,
+  getLastUpload,
+  clearLastUpload,
+} = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
 const { suggestCaptions, suggestCountryIntro } = require('../lib/grokText');
@@ -44,9 +52,10 @@ bot.use(async (ctx, next) => {
 
 bot.start((ctx) =>
   ctx.reply(
-    'Mandame una foto y te pregunto de qué país es (o "sin ubicación" si no aplica, ej. Modelos). ' +
-      'En un rato queda publicada en cantbelievetheview.com.\n\n' +
-      'En cualquier momento: /back para volver un paso atrás, /cancel para cortar todo.'
+    'Mandame una foto (o varias juntas) y te pregunto de qué país es (o "sin ubicación" si no aplica, ' +
+      'ej. Modelos). En un rato queda publicada en cantbelievetheview.com.\n\n' +
+      'En cualquier momento: /back para volver un paso atrás, /cancel para cortar todo.\n' +
+      '/undo deshace la última subida. /recientes muestra las últimas fotos subidas.'
   )
 );
 
@@ -58,6 +67,88 @@ bot.start((ctx) =>
 bot.command('cancel', async (ctx) => {
   await clearSession(ctx.chat.id);
   return ctx.reply('Cancelado. Mandame otra foto cuando quieras.', Markup.removeKeyboard());
+});
+
+// El id de cada foto es "<key>-<timestamp>[-<índice>]" (ver finalize) — de
+// ahí se puede sacar cuándo se subió sin necesitar guardar una fecha aparte.
+function timestampFromPhotoId(id) {
+  const m = id.match(/-(\d{10,})(?:-\d+)?$/);
+  return m ? parseInt(m[1], 10) : 0;
+}
+
+bot.command('recientes', async (ctx) => {
+  const { json: siteData } = await getSiteData();
+  const all = [];
+  siteData.visited.forEach((c) => (c.photos || []).forEach((p) => all.push({ ...p, place: c.name })));
+  siteData.categories.forEach((cat) => (cat.photos || []).forEach((p) => all.push({ ...p, place: cat.name })));
+  all.sort((a, b) => timestampFromPhotoId(b.id) - timestampFromPhotoId(a.id));
+
+  if (!all.length) return ctx.reply('Todavía no hay ninguna foto subida.');
+
+  const lines = all.slice(0, 8).map((p) => `• "${p.caption}" — ${p.place}`);
+  return ctx.reply(`Últimas ${lines.length} fotos:\n\n` + lines.join('\n'));
+});
+
+// Deshace la última subida (por chat) — saca la(s) foto(s) de data.json, si
+// era un país nuevo lo devuelve a "sin fotos", borra el registro de
+// duplicados de esos archivos, y listo. Solo funciona sobre lo último que
+// se subió (24hs de margen) — no es un historial completo de cambios.
+bot.command('undo', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const last = await getLastUpload(chatId);
+  if (!last) {
+    return ctx.reply('No tengo ninguna subida reciente para deshacer (o ya pasaron más de 24hs).');
+  }
+
+  try {
+    const { json: siteData, sha } = await getSiteData();
+    let label = '';
+    let removed = 0;
+
+    const removeFrom = (arr) => {
+      const before = arr.length;
+      const kept = arr.filter((p) => !last.photoIds.includes(p.id));
+      removed += before - kept.length;
+      return kept;
+    };
+
+    if (last.targetType === 'category') {
+      const cat = siteData.categories.find((c) => c.key === last.targetKey);
+      if (cat) {
+        cat.photos = removeFrom(cat.photos || []);
+        label = cat.name;
+      }
+    } else {
+      // country_existing o country_new — en ambos casos, para cuando se
+      // subió, el país ya vive en "visited" (country_new lo mueve ahí en
+      // el momento de subir).
+      const c = siteData.visited.find((x) => x.key === last.targetKey);
+      if (c) {
+        c.photos = removeFrom(c.photos || []);
+        label = c.name;
+        // Si esta subida fue la que creó el país y no le quedan fotos,
+        // deshacemos también la creación — vuelve a "sin fotos".
+        if (last.wasNewCountry && c.photos.length === 0) {
+          siteData.visited = siteData.visited.filter((x) => x.key !== last.targetKey);
+          siteData.visitedEmpty.push({ key: c.key, name: c.name, lat: c.lat, lng: c.lng, w: c.w, h: c.h });
+          siteData.visitedEmpty.sort((a, b) => a.name.localeCompare(b.name, 'es'));
+        }
+      }
+    }
+
+    if (removed === 0) {
+      return ctx.reply('No encontré esa foto en el sitio — puede que ya la hayas borrado a mano.');
+    }
+
+    await commitSiteData(siteData, sha, `↩️ Deshecho: ${removed} foto(s) de ${label}`);
+    await Promise.all((last.hashes || []).map(deleteHash));
+    await clearLastUpload(chatId);
+
+    return ctx.reply(`↩️ Deshecho — se sacaron ${removed} foto(s) de ${label}.`);
+  } catch (err) {
+    console.error('Error deshaciendo:', err);
+    return ctx.reply('❌ No pude deshacerlo: ' + err.message);
+  }
 });
 
 // --- 1. llega una foto -------------------------------------------------------
@@ -83,7 +174,9 @@ const locationPrompt =
 async function askCaption(ctx, session) {
   const chatId = ctx.chat.id;
   try {
-    const fileLink = await ctx.telegram.getFileLink(session.fileId);
+    // Con álbum, usamos la primera foto como representativa del lote para
+    // las sugerencias — el mismo título se aplica a todas.
+    const fileLink = await ctx.telegram.getFileLink(session.fileIds[0]);
     const suggestions = await suggestCaptions(fileLink.href, 3);
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingCaptions = suggestions;
@@ -187,6 +280,16 @@ bot.command('back', async (ctx) => {
       return ctx.reply(locationPrompt, locationKeyboard);
     }
 
+    case 'await_final_confirm':
+      if (session.target.type === 'category') {
+        delete session.lat;
+        delete session.lng;
+        session.step = 'await_location';
+        await setSession(chatId, session);
+        return ctx.reply(locationPrompt, locationKeyboard);
+      }
+      return askCategoryTag(ctx, session);
+
     default:
       return ctx.reply('No puedo volver atrás desde acá — usá /cancel si querés arrancar de nuevo.');
   }
@@ -196,17 +299,40 @@ bot.on('photo', async (ctx) => {
   const photos = ctx.message.photo;
   const best = photos[photos.length - 1]; // la de mayor resolución
   const chatId = ctx.chat.id;
+  const groupId = ctx.message.media_group_id || null;
+
+  // Varias fotos mandadas juntas (álbum de Telegram) comparten media_group_id
+  // y llegan como updates SEPARADOS, sin ningún evento de "fin de álbum" —
+  // así que las vamos juntando en la sesión hasta que Mario toca "Listo".
+  // (Nota: si dos fotos del mismo álbum llegan a webhooks casi simultáneos,
+  // hay una ventana chica de condición de carrera al leer/escribir la
+  // sesión — aceptable para un bot de un solo usuario, no se resuelve acá.)
+  if (groupId) {
+    const existingSession = await getSession(chatId);
+    if (existingSession && existingSession.step === 'await_album_more' && existingSession.albumGroupId === groupId) {
+      existingSession.fileIds.push(best.file_id);
+      await setSession(chatId, existingSession);
+      return; // no respondemos de nuevo por cada foto — spamearía el chat
+    }
+    await setSession(chatId, { step: 'await_album_more', albumGroupId: groupId, fileIds: [best.file_id] });
+    return ctx.reply(
+      '📸 Detecté varias fotos juntas — te las voy juntando. Tocá "✅ Listo" cuando termines de mandarlas.',
+      { reply_markup: { inline_keyboard: [[{ text: '✅ Listo, continuar', callback_data: 'album:done' }]] } }
+    );
+  }
 
   // Detección de duplicados: mismo archivo (hash) ya subido antes, sin
   // importar cuándo ni a qué país/categoría. Si falla el chequeo (ej. la
   // API de Telegram no responde) seguimos igual — no bloqueamos por esto.
+  // Solo aplica a fotos sueltas — para un álbum sería un chequeo por foto,
+  // se simplifica dejándolo afuera por ahora.
   let hash = null;
   try {
     const fileLink = await ctx.telegram.getFileLink(best.file_id);
     hash = hashBuffer(await downloadBuffer(fileLink.href));
     const existing = await findByHash(hash);
     if (existing) {
-      await setSession(chatId, { step: 'await_duplicate_confirm', fileId: best.file_id, hash });
+      await setSession(chatId, { step: 'await_duplicate_confirm', fileIds: [best.file_id], hash });
       return ctx.reply(
         `⚠️ Esta foto ya está subida — en ${existing.label}.\n¿La subís igual (ej. para otro país o categoría) o cancelamos?`,
         {
@@ -223,7 +349,7 @@ bot.on('photo', async (ctx) => {
     console.error('Error chequeando duplicado:', err);
   }
 
-  await setSession(chatId, { step: 'await_country', fileId: best.file_id, hash });
+  await setSession(chatId, { step: 'await_country', fileIds: [best.file_id], hash });
   await ctx.reply(askCountryText);
 });
 
@@ -244,6 +370,16 @@ bot.on('callback_query', async (ctx) => {
   if (!session) {
     await ctx.answerCbQuery();
     return ctx.editMessageText('Esta conversación ya expiró — mandame la foto de nuevo.');
+  }
+
+  // Terminó de mandar las fotos del álbum — arranca el flujo normal
+  // (país/categoría/etc.) una sola vez para todo el lote junto.
+  if (data === 'album:done') {
+    await ctx.answerCbQuery();
+    session.step = 'await_country';
+    await setSession(chatId, session);
+    await ctx.editMessageText(`📸 ${session.fileIds.length} foto(s) juntadas ✅`);
+    return ctx.reply(askCountryText);
   }
 
   // Confirmación de un país ambiguo (varios candidatos parecidos al texto).
@@ -271,9 +407,14 @@ bot.on('callback_query', async (ctx) => {
   if (data.startsWith('tag:g:') || data === 'tag:none') {
     await ctx.answerCbQuery();
     session.categoryKey = data === 'tag:none' ? null : data.slice('tag:g:'.length);
-    session.step = 'finalize';
-    await setSession(chatId, session);
     await ctx.editMessageText(session.categoryKey ? 'Categoría marcada.' : 'Sin categoría temática.');
+    return askFinalConfirm(ctx, session);
+  }
+
+  // Confirmó el resumen final — recién ahí se sube de verdad.
+  if (data === 'confirm:yes') {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('Dale, subiendo…');
     return finalize(ctx, session);
   }
 
@@ -358,6 +499,14 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_duplicate_confirm') {
     return ctx.reply('Tocá uno de los botones de arriba (✅ Subir igual / ✖️ Cancelar) para seguir.');
+  }
+
+  if (session.step === 'await_album_more') {
+    return ctx.reply('Mandame más fotos del álbum, o tocá "✅ Listo, continuar" cuando termines.');
+  }
+
+  if (session.step === 'await_final_confirm') {
+    return ctx.reply('Tocá "✅ Confirmar y subir", o /back si algo está mal.');
   }
 
   if (session.step === 'await_caption_choice') {
@@ -494,9 +643,7 @@ async function afterLocation(ctx, session) {
   if (session.target.type === 'country_existing') {
     return askCategoryTag(ctx, session);
   }
-  session.step = 'finalize';
-  await setSession(chatId, session);
-  return finalize(ctx, session);
+  return askFinalConfirm(ctx, session);
 }
 
 // Casi toda foto de un país puede pertenecer ADEMÁS a una categoría temática
@@ -511,37 +658,86 @@ async function askCategoryTag(ctx, session) {
   });
 }
 
-// --- 4. subir la foto y commitear data.json ------------------------------------
+// Resumen antes de subir de verdad — junta todo lo que se acumuló en la
+// sesión para poder pescar un error (país equivocado, caption con typo)
+// antes de commitear, no después. /back desde acá vuelve al paso de
+// categoría (o ubicación, si no hay país).
+async function askFinalConfirm(ctx, session) {
+  const chatId = ctx.chat.id;
+  const { json: siteData } = await getSiteData();
+
+  let placeLabel = session.target.key;
+  if (session.target.type === 'category') {
+    const cat = siteData.categories.find((c) => c.key === session.target.key);
+    if (cat) placeLabel = cat.name;
+  } else {
+    const arr = session.target.type === 'country_new' ? siteData.visitedEmpty : siteData.visited;
+    const c = arr.find((x) => x.key === session.target.key);
+    if (c) placeLabel = c.name;
+  }
+  const tagCat = session.categoryKey ? siteData.categories.find((c) => c.key === session.categoryKey) : null;
+
+  const lines = [`📍 ${placeLabel}${tagCat ? ' + ' + tagCat.name : ''}`, `📝 "${session.caption}"`];
+  if (session.fileIds.length > 1) lines.push(`🖼 ${session.fileIds.length} fotos juntas`);
+  if (session.lat !== undefined) lines.push(`🗺 ${session.lat.toFixed(4)}, ${session.lng.toFixed(4)}`);
+  if (session.descEs) lines.push(`✍️ Intro del país: "${session.descEs}"`);
+  lines.push('', '¿Confirmás?');
+
+  session.step = 'await_final_confirm';
+  await setSession(chatId, session);
+  return ctx.reply(lines.join('\n'), {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Confirmar y subir', callback_data: 'confirm:yes' }],
+        [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
+      ],
+    },
+  });
+}
+
+// --- 4. subir la(s) foto(s) y commitear data.json ------------------------------
+// session.fileIds siempre es un array — una foto sola es un array de 1
+// (así no hace falta duplicar esta lógica para álbumes).
 async function finalize(ctx, session) {
   const chatId = ctx.chat.id;
+  const fileIds = session.fileIds;
   try {
-    await ctx.reply('Subiendo la foto y actualizando el sitio…');
+    await ctx.reply(
+      fileIds.length > 1 ? `Subiendo ${fileIds.length} fotos y actualizando el sitio…` : 'Subiendo la foto y actualizando el sitio…'
+    );
 
-    const fileLink = await ctx.telegram.getFileLink(session.fileId);
-    const publicIdHint = `${session.target.key}-${Date.now()}`;
-    const { cleanUrl, displayUrl, hash } = await uploadFromUrl(fileLink.href, publicIdHint);
-    const photoId = publicIdHint;
+    // Se sube cada archivo antes de tocar data.json — si algo falla acá
+    // (ej. la 2ª de 3 fotos), no queda un commit a medio hacer.
+    const photoEntries = [];
+    const uploaded = []; // {hash, photoId} de cada una, para registrar duplicados después
+    for (let i = 0; i < fileIds.length; i++) {
+      const fileLink = await ctx.telegram.getFileLink(fileIds[i]);
+      const publicIdHint = fileIds.length > 1 ? `${session.target.key}-${Date.now()}-${i}` : `${session.target.key}-${Date.now()}`;
+      const { cleanUrl, displayUrl, hash } = await uploadFromUrl(fileLink.href, publicIdHint);
+      const photoId = publicIdHint;
 
-    // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
-    // data.json, que es público. data.json solo se entera del id y de la
-    // versión con marca de agua.
-    await saveCleanUrl(photoId, cleanUrl);
+      // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
+      // data.json, que es público. data.json solo se entera del id y de la
+      // versión con marca de agua.
+      await saveCleanUrl(photoId, cleanUrl);
 
-    // Solo le agregamos lat/lng a la foto si de verdad la compartiste — así
-    // el sitio sabe que es una coordenada real (si no, la galería se la
-    // inventa aproximada a partir del país/categoría, como venía haciendo).
-    const photoEntry = { id: photoId, displayUrl, caption: session.caption };
-    if (session.lat !== undefined) {
-      photoEntry.lat = session.lat;
-      photoEntry.lng = session.lng;
-    }
-    // Tag opcional de categoría temática — solo aplica a fotos de país (la
-    // rama "category" de abajo, ej. Modelos, ya está tagueada por estar bajo
-    // esa categoría directamente). La galería de la categoría en el sitio
-    // suma esta foto sin duplicarla en data.json (ver photosForCategory en
-    // index.html).
-    if (session.categoryKey) {
-      photoEntry.categoryKey = session.categoryKey;
+      const photoEntry = { id: photoId, displayUrl, caption: session.caption };
+      // Solo le agregamos lat/lng a la foto si de verdad la compartiste —
+      // así el sitio sabe que es una coordenada real (si no, la galería se
+      // la inventa aproximada a partir del país/categoría, como ya hacía).
+      if (session.lat !== undefined) {
+        photoEntry.lat = session.lat;
+        photoEntry.lng = session.lng;
+      }
+      // Tag opcional de categoría temática — solo aplica a fotos de país
+      // (la rama "category" de abajo, ej. Modelos, ya está tagueada por
+      // estar bajo esa categoría directamente). La galería de la categoría
+      // en el sitio suma esta foto sin duplicarla en data.json (ver
+      // photosForCategory en index.html).
+      if (session.categoryKey) photoEntry.categoryKey = session.categoryKey;
+
+      photoEntries.push(photoEntry);
+      uploaded.push({ hash, photoId });
     }
 
     const { json: siteData, sha } = await getSiteData();
@@ -551,13 +747,13 @@ async function finalize(ctx, session) {
       const cat = siteData.categories.find((c) => c.key === session.target.key);
       if (!cat) throw new Error(`No encontré la categoría "${session.target.key}" en data.json`);
       cat.photos = cat.photos || [];
-      cat.photos.push(photoEntry);
+      cat.photos.push(...photoEntries);
       label = cat.name;
     } else if (session.target.type === 'country_existing') {
       const c = siteData.visited.find((x) => x.key === session.target.key);
       if (!c) throw new Error(`No encontré el país "${session.target.key}" en visited`);
       c.photos = c.photos || [];
-      c.photos.push(photoEntry);
+      c.photos.push(...photoEntries);
       label = c.name;
     } else if (session.target.type === 'country_new') {
       const idx = siteData.visitedEmpty.findIndex((x) => x.key === session.target.key);
@@ -572,27 +768,36 @@ async function finalize(ctx, session) {
         h: c.h,
         desc: session.descEs,
         descEn: session.descEn,
-        photos: [photoEntry],
+        photos: photoEntries,
       });
       label = c.name;
     }
 
-    const tagCat = photoEntry.categoryKey
-      ? siteData.categories.find((c) => c.key === photoEntry.categoryKey)
-      : null;
+    const tagCat = session.categoryKey ? siteData.categories.find((c) => c.key === session.categoryKey) : null;
     const fullLabel = tagCat ? `${label} + ${tagCat.name}` : label;
+    const countLabel = photoEntries.length > 1 ? `${photoEntries.length} fotos` : `"${session.caption}"`;
 
-    const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${session.caption} — ${fullLabel}`;
+    const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${countLabel} — ${fullLabel}`;
     await commitSiteData(siteData, sha, message);
 
-    // Registrar el hash del archivo — así, si esta misma foto se vuelve a
-    // mandar más adelante, el bot avisa antes de subirla de nuevo.
-    await saveHash(hash, photoId, fullLabel);
+    // Registrar el hash de cada archivo — así, si alguna se vuelve a mandar
+    // más adelante, el bot avisa antes de subirla de nuevo.
+    await Promise.all(uploaded.map(({ hash, photoId }) => saveHash(hash, photoId, fullLabel)));
+
+    // Para poder deshacer con /undo — qué se subió y a dónde.
+    await saveLastUpload(chatId, {
+      photoIds: photoEntries.map((p) => p.id),
+      hashes: uploaded.map((u) => u.hash),
+      targetType: session.target.type,
+      targetKey: session.target.key,
+      wasNewCountry: session.target.type === 'country_new',
+    });
 
     await clearSession(chatId);
     await ctx.reply(
-      `✅ Listo — "${session.caption}" agregada a ${fullLabel}.\n` +
-        `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.`
+      `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.\n` +
+        `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.\n\n` +
+        `(¿Te equivocaste? Mandá /undo para deshacerlo.)`
     );
   } catch (err) {
     console.error(err);
