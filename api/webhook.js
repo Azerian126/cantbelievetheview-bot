@@ -2,9 +2,10 @@ const { Telegraf, Markup } = require('telegraf');
 const { getSession, setSession, clearSession } = require('../lib/session');
 const { categoryMenu, categoryTagMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
-const { uploadFromUrl, downloadBuffer, hashBuffer } = require('../lib/cloudinary');
+const { uploadFromUrl, uploadPrintDerivatives, downloadBuffer, hashBuffer } = require('../lib/cloudinary');
 const {
   saveCleanUrl,
+  savePrintUrls,
   findByHash,
   saveHash,
   deleteHash,
@@ -1155,13 +1156,29 @@ async function finalize(ctx, session) {
     for (let i = 0; i < fileIds.length; i++) {
       const fileLink = await ctx.telegram.getFileLink(fileIds[i]);
       const publicIdHint = fileIds.length > 1 ? `${session.target.key}-${Date.now()}-${i}` : `${session.target.key}-${Date.now()}`;
-      const { cleanUrl, displayUrl, hash } = await uploadFromUrl(fileLink.href, publicIdHint);
+      const { cleanUrl, displayUrl, hash, buffer } = await uploadFromUrl(fileLink.href, publicIdHint);
       const photoId = publicIdHint;
 
       // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
       // data.json, que es público. data.json solo se entera del id y de la
       // versión con marca de agua.
       await saveCleanUrl(photoId, cleanUrl);
+
+      // Derivadas de impresión: la edición de Mario (pantalla, emite luz)
+      // satura más de lo que el papel/aluminio (reflejan luz) pueden
+      // reproducir — sin esto, esa zona se imprime como una mancha plana en
+      // vez del detalle real. Se generan a partir del buffer ORIGINAL (no
+      // de displayUrl, que ya tiene marca de agua y menos resolución) y se
+      // guardan aparte, igual que cleanUrl — el checkout las usa al armar
+      // el pedido a Prodigi según el material comprado (ver
+      // cantbelievetheview-api/api/stripe-webhook.js). Si falla, no bloquea
+      // la subida — el checkout cae a la foto limpia sin preparar.
+      try {
+        const printUrls = await uploadPrintDerivatives(buffer, photoId);
+        if (Object.keys(printUrls).length) await savePrintUrls(photoId, printUrls);
+      } catch (err) {
+        console.error('Error generando derivadas de impresión:', err);
+      }
 
       const photoEntry = { id: photoId, displayUrl, caption: session.captions[i] };
       // Traducción al inglés del título — sin esto, el sitio en inglés
