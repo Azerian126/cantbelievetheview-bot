@@ -252,12 +252,20 @@ const locationPrompt =
 // Grok mira la foto y sugiere títulos — Mario elige uno o escribe el suyo.
 // Si falla la generación (sin key, sin crédito, error de red), cae al modo
 // manual de siempre en vez de trabar el flujo.
+//
+// Con álbum, se pide un título POR FOTO (no uno solo para todo el lote) —
+// session.captionIndex indica cuál toca ahora, y la foto en cuestión se
+// reenvía junto con la pregunta para que quede claro de cuál se habla (con
+// varias fotos juntas, "el título de la foto" a secas era ambiguo).
 async function askCaption(ctx, session) {
   const chatId = ctx.chat.id;
+  const idx = session.captionIndex || 0;
+  const fileId = session.fileIds[idx];
+  const total = session.fileIds.length;
+  const label = total > 1 ? `📸 Foto ${idx + 1} de ${total}\n` : '';
+
   try {
-    // Con álbum, usamos la primera foto como representativa del lote para
-    // las sugerencias — el mismo título se aplica a todas.
-    const fileLink = await ctx.telegram.getFileLink(session.fileIds[0]);
+    const fileLink = await ctx.telegram.getFileLink(fileId);
     const suggestions = await suggestCaptions(fileLink.href, 3);
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingCaptions = suggestions;
@@ -265,13 +273,34 @@ async function askCaption(ctx, session) {
     await setSession(chatId, session);
     const rows = suggestions.map((s, i) => [{ text: s, callback_data: `cap:${i}` }]);
     rows.push([{ text: '✏️ Escribir el mío', callback_data: 'cap:own' }]);
-    return ctx.reply('Elegí un título o escribí el tuyo:', { reply_markup: { inline_keyboard: rows } });
+    return ctx.replyWithPhoto(fileId, {
+      caption: `${label}Elegí un título o escribí el tuyo:`,
+      reply_markup: { inline_keyboard: rows },
+    });
   } catch (err) {
     console.error('Error generando títulos:', err);
     session.step = 'await_caption';
     await setSession(chatId, session);
-    return ctx.reply('No pude generar sugerencias — mandame el título / descripción corta de la foto (en español).');
+    return ctx.replyWithPhoto(fileId, {
+      caption: `${label}No pude generar sugerencias — mandame el título / descripción corta de esta foto (en español).`,
+    });
   }
+}
+
+// Guarda el título de la foto actual y pasa a la siguiente del lote (si
+// hay) o sigue el flujo normal (si ya se tituló todo).
+async function advanceCaption(ctx, session, caption) {
+  const chatId = ctx.chat.id;
+  session.captions = session.captions || [];
+  session.captions[session.captionIndex || 0] = caption;
+  session.captionIndex = (session.captionIndex || 0) + 1;
+
+  if (session.captionIndex < session.fileIds.length) {
+    return askCaption(ctx, session);
+  }
+  session.step = 'await_location';
+  await setSession(chatId, session);
+  return ctx.reply(locationPrompt, locationKeyboard);
 }
 
 // Igual que askCaption pero para la intro de un país nuevo — no mira
@@ -313,21 +342,36 @@ bot.command('back', async (ctx) => {
 
   switch (session.step) {
     case 'await_caption_choice':
-    case 'await_caption':
-      delete session.target;
+    case 'await_caption': {
       delete session.pendingCaptions;
+      const idx = session.captionIndex || 0;
+      if (idx > 0) {
+        // Álbum: volvés a la foto ANTERIOR del lote, no a elegir país de nuevo.
+        session.captionIndex = idx - 1;
+        if (session.captions) session.captions.pop();
+        return askCaption(ctx, session);
+      }
+      delete session.target;
+      delete session.captions;
+      delete session.captionIndex;
       session.step = 'await_country';
       await setSession(chatId, session);
       return ctx.reply(askCountryText);
+    }
 
     case 'await_no_country_category':
       session.step = 'await_country';
       await setSession(chatId, session);
       return ctx.reply(askCountryText);
 
-    case 'await_location':
-      delete session.caption;
+    case 'await_location': {
+      // Vuelve a preguntar el título de la última foto del lote, para
+      // poder corregirlo.
+      const lastIdx = session.fileIds.length - 1;
+      session.captionIndex = lastIdx;
+      if (session.captions) session.captions.splice(lastIdx, 1);
       return askCaption(ctx, session);
+    }
 
     case 'await_intro_choice':
     case 'await_desc_es':
@@ -555,10 +599,47 @@ bot.on('callback_query', async (ctx) => {
   // (país/categoría/etc.) una sola vez para todo el lote junto.
   if (data === 'album:done') {
     await ctx.answerCbQuery();
+    if (session.fileIds.length === 1) {
+      session.step = 'await_country';
+      await setSession(chatId, session);
+      await ctx.editMessageText('📸 1 foto ✅');
+      return ctx.reply(askCountryText);
+    }
+    // Con más de una foto, hay que saber si van todas al mismo país o no
+    // antes de preguntar nada más — si no, asumíamos "mismo país" siempre,
+    // y un álbum de varios lugares distintos quedaba mal etiquetado.
+    session.step = 'await_album_scope';
+    await setSession(chatId, session);
+    return ctx.editMessageText(
+      `📸 ${session.fileIds.length} fotos juntadas ✅\n¿Son todas del mismo país, o hay de varios países distintos?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '🌍 Mismo país para todas', callback_data: 'album:same' }],
+            [{ text: '🌎 Son de varios países', callback_data: 'album:multi' }],
+          ],
+        },
+      }
+    );
+  }
+
+  if (data === 'album:same') {
+    await ctx.answerCbQuery();
     session.step = 'await_country';
     await setSession(chatId, session);
-    await ctx.editMessageText(`📸 ${session.fileIds.length} foto(s) juntadas ✅`);
+    await ctx.editMessageText(`Dale, un solo país para las ${session.fileIds.length} fotos.`);
     return ctx.reply(askCountryText);
+  }
+
+  // Son de países distintos — en vez de un target único para el lote, las
+  // procesamos una por una, de punta a punta (país, título, ubicación,
+  // categoría, confirmar, subir), encadenadas solas — ver startNextAlbumItem.
+  if (data === 'album:multi') {
+    await ctx.answerCbQuery();
+    const total = session.fileIds.length;
+    const [firstFileId, ...rest] = session.fileIds;
+    await ctx.editMessageText(`Dale, las voy procesando una por una (${total} en total).`);
+    return startNextAlbumItem(ctx, chatId, firstFileId, rest, total);
   }
 
   // Confirmación de un país ambiguo (varios candidatos parecidos al texto).
@@ -623,24 +704,25 @@ bot.on('callback_query', async (ctx) => {
     return afterLocation(ctx, session);
   }
 
-  // Eligió uno de los títulos que sugirió Grok mirando la foto.
+  // Eligió uno de los títulos que sugirió Grok mirando la foto (el mensaje
+  // es una foto con caption, no texto plano — se edita distinto).
   if (data.startsWith('cap:')) {
     await ctx.answerCbQuery();
     if (data === 'cap:own') {
       delete session.pendingCaptions;
       session.step = 'await_caption';
       await setSession(chatId, session);
-      return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
+      const idx = session.captionIndex || 0;
+      const total = session.fileIds.length;
+      const label = total > 1 ? `📸 Foto ${idx + 1} de ${total}\n` : '';
+      return ctx.editMessageCaption(`${label}Mandame el título / descripción corta de esta foto (en español).`);
     }
     const idx = parseInt(data.slice('cap:'.length), 10);
     const caption = session.pendingCaptions && session.pendingCaptions[idx];
-    if (!caption) return ctx.editMessageText('Esa opción ya venció — escribí el título a mano.');
-    session.caption = caption;
+    if (!caption) return ctx.editMessageCaption('Esa opción ya venció — escribí el título a mano.');
     delete session.pendingCaptions;
-    session.step = 'await_location';
-    await setSession(chatId, session);
-    await ctx.editMessageText(`Título: "${caption}" ✅`);
-    return ctx.reply(locationPrompt, locationKeyboard);
+    await ctx.editMessageCaption(`Título: "${caption}" ✅`);
+    return advanceCaption(ctx, session, caption);
   }
 
   // Eligió una de las intros que sugirió Grok para el país nuevo.
@@ -682,6 +764,10 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_album_more') {
     return ctx.reply('Mandame más fotos del álbum, o tocá "✅ Listo, continuar" cuando termines.');
+  }
+
+  if (session.step === 'await_album_scope') {
+    return ctx.reply('Tocá una de las dos opciones de arriba (mismo país / varios países).');
   }
 
   if (session.step === 'await_final_confirm') {
@@ -754,10 +840,7 @@ bot.on('text', async (ctx) => {
   }
 
   if (session.step === 'await_caption') {
-    session.caption = text;
-    session.step = 'await_location';
-    await setSession(chatId, session);
-    return ctx.reply(locationPrompt, locationKeyboard);
+    return advanceCaption(ctx, session, text);
   }
 
   if (session.step === 'await_location') {
@@ -844,6 +927,15 @@ async function afterLocation(ctx, session) {
   return askFinalConfirm(ctx, session);
 }
 
+// Arranca (o continúa) el flujo de país/título/etc. para UNA foto de un
+// álbum "de varios países" — cada una pasa por todo el proceso normal de
+// punta a punta, encadenadas solas sin que haga falta reenviarlas.
+async function startNextAlbumItem(ctx, chatId, fileId, queue, total) {
+  const position = total - queue.length;
+  await setSession(chatId, { step: 'await_country', fileIds: [fileId], albumQueue: queue, albumTotal: total });
+  return ctx.reply(`📸 Foto ${position} de ${total} — ${askCountryText}`);
+}
+
 // Casi toda foto de un país puede pertenecer ADEMÁS a una categoría temática
 // (no es alternativa a tener país — es un tag extra, opcional).
 async function askCategoryTag(ctx, session) {
@@ -875,8 +967,13 @@ async function askFinalConfirm(ctx, session) {
   }
   const tagCat = session.categoryKey ? siteData.categories.find((c) => c.key === session.categoryKey) : null;
 
-  const lines = [`📍 ${placeLabel}${tagCat ? ' + ' + tagCat.name : ''}`, `📝 "${session.caption}"`];
-  if (session.fileIds.length > 1) lines.push(`🖼 ${session.fileIds.length} fotos juntas`);
+  const lines = [`📍 ${placeLabel}${tagCat ? ' + ' + tagCat.name : ''}`];
+  if (session.captions.length > 1) {
+    lines.push(`📝 ${session.captions.length} fotos:`);
+    session.captions.forEach((c, i) => lines.push(`   ${i + 1}. "${c}"`));
+  } else {
+    lines.push(`📝 "${session.captions[0]}"`);
+  }
   if (session.lat !== undefined) lines.push(`🗺 ${session.lat.toFixed(4)}, ${session.lng.toFixed(4)}`);
   if (session.descEs) lines.push(`✍️ Intro del país: "${session.descEs}"`);
   lines.push('', '¿Confirmás?');
@@ -919,7 +1016,7 @@ async function finalize(ctx, session) {
       // versión con marca de agua.
       await saveCleanUrl(photoId, cleanUrl);
 
-      const photoEntry = { id: photoId, displayUrl, caption: session.caption };
+      const photoEntry = { id: photoId, displayUrl, caption: session.captions[i] };
       // Solo le agregamos lat/lng a la foto si de verdad la compartiste —
       // así el sitio sabe que es una coordenada real (si no, la galería se
       // la inventa aproximada a partir del país/categoría, como ya hacía).
@@ -973,7 +1070,7 @@ async function finalize(ctx, session) {
 
     const tagCat = session.categoryKey ? siteData.categories.find((c) => c.key === session.categoryKey) : null;
     const fullLabel = tagCat ? `${label} + ${tagCat.name}` : label;
-    const countLabel = photoEntries.length > 1 ? `${photoEntries.length} fotos` : `"${session.caption}"`;
+    const countLabel = photoEntries.length > 1 ? `${photoEntries.length} fotos` : `"${session.captions[0]}"`;
 
     const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${countLabel} — ${fullLabel}`;
     await commitSiteData(siteData, sha, message);
@@ -991,11 +1088,21 @@ async function finalize(ctx, session) {
       wasNewCountry: session.target.type === 'country_new',
     });
 
+    // Álbum "de varios países": si quedan más fotos en la cola, encadenamos
+    // con la siguiente en vez de cerrar acá — el usuario no tiene que
+    // reenviar nada, sigue solo.
+    if (session.albumQueue && session.albumQueue.length > 0) {
+      await ctx.reply(`✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.`);
+      const [nextFileId, ...rest] = session.albumQueue;
+      return startNextAlbumItem(ctx, chatId, nextFileId, rest, session.albumTotal);
+    }
+
     await clearSession(chatId);
+    const albumDone = session.albumTotal ? `\n🎉 Terminaste las ${session.albumTotal} fotos del álbum.` : '';
     await ctx.reply(
-      `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.\n` +
+      `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${albumDone}\n` +
         `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.\n\n` +
-        `(¿Te equivocaste? Mandá /undo para deshacerlo.)`
+        `(¿Te equivocaste? Mandá /undo para deshacerlo${session.albumTotal ? ' de esta última' : ''}.)`
     );
   } catch (err) {
     console.error(err);
