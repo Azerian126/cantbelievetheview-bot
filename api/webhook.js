@@ -14,7 +14,7 @@ const {
 } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
-const { suggestCaptions, suggestCountryIntro, translateCaption } = require('../lib/grokText');
+const { suggestCaptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -428,11 +428,6 @@ bot.command('back', async (ctx) => {
       return askLocation(ctx, session);
     }
 
-    case 'await_desc_en':
-      session.step = 'await_desc_es';
-      await setSession(chatId, session);
-      return ctx.reply('Mandame de nuevo la descripción en español.', Markup.removeKeyboard());
-
     case 'await_category_tag': {
       delete session.categoryKey;
       if (session.target.type === 'country_new') {
@@ -838,7 +833,7 @@ bot.on('text', async (ctx) => {
       if (!loc) throw new Error('Ya no encuentro esa foto.');
       loc.photo.caption = text;
       try {
-        const captionEn = await translateCaption(text);
+        const captionEn = await translateToEnglish(text);
         if (captionEn) loc.photo.captionEn = captionEn;
         else delete loc.photo.captionEn;
       } catch (err) {
@@ -937,13 +932,15 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_desc_es') {
     session.descEs = text;
-    session.step = 'await_desc_en';
-    await setSession(chatId, session);
-    return ctx.reply('Ahora la misma descripción en inglés (o mandá "-" para dejarla igual).', Markup.removeKeyboard());
-  }
-
-  if (session.step === 'await_desc_en') {
-    session.descEn = text === '-' ? session.descEs : text;
+    // Traducción automática — antes se pedía escribirla dos veces, y mandar
+    // "-" para "dejarla igual" literalmente copiaba el español sin traducir
+    // nada (así quedó "Templos y neblina." también en la versión inglesa).
+    try {
+      session.descEn = await translateToEnglish(text);
+    } catch (err) {
+      console.error('Error traduciendo descripción de país:', err);
+      session.descEn = text; // mejor mostrar el español que romper el flujo
+    }
     await setSession(chatId, session);
     return askCategoryTag(ctx, session);
   }
@@ -1082,7 +1079,7 @@ async function finalize(ctx, session) {
       // inglés). Si falla la traducción no bloqueamos la subida — el sitio
       // ya cae solo al español si no encuentra captionEn.
       try {
-        const captionEn = await translateCaption(session.captions[i]);
+        const captionEn = await translateToEnglish(session.captions[i]);
         if (captionEn) photoEntry.captionEn = captionEn;
       } catch (err) {
         console.error('Error traduciendo caption:', err);
