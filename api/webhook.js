@@ -242,6 +242,14 @@ function shortenPlace(name, max = 60) {
   return name.length > max ? name.slice(0, max - 1) + '…' : name;
 }
 
+// Nota chica con lo que costó esa llamada puntual a Grok — Mario la pidió
+// para no tener que ir a mirar la consola de xAI cada vez. costUsd puede
+// venir null (ej. si xAI no devolvió el dato) — en ese caso no se muestra
+// nada en vez de mostrar "$null".
+function costNote(costUsd) {
+  return costUsd != null ? `\n\n💰 $${costUsd.toFixed(3)}` : '';
+}
+
 const askCountryText =
   '¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).';
 
@@ -289,9 +297,10 @@ async function askDescription(ctx, session, lengthHint) {
 
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
-    const suggestions = await suggestDescriptions(fileLink.href, title, 3, lengthHint);
+    const { suggestions, costUsd } = await suggestDescriptions(fileLink.href, title, 3, lengthHint);
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingDescriptions = suggestions;
+    session.aiCostUsd = (session.aiCostUsd || 0) + (costUsd || 0);
     session.step = 'await_desc_choice';
     await setSession(chatId, session);
     const rows = suggestions.map((s, i) => [{ text: s, callback_data: `desc:${i}` }]);
@@ -300,7 +309,9 @@ async function askDescription(ctx, session, lengthHint) {
       { text: '🔄 Más larga', callback_data: 'desc:longer' },
     ]);
     rows.push([{ text: '✏️ Escribir la mía', callback_data: 'desc:own' }]);
-    return ctx.reply('Elegí una descripción corta o escribí la tuya:', { reply_markup: { inline_keyboard: rows } });
+    return ctx.reply(`Elegí una descripción corta o escribí la tuya:${costNote(costUsd)}`, {
+      reply_markup: { inline_keyboard: rows },
+    });
   } catch (err) {
     console.error('Error generando descripciones:', err);
     session.step = 'await_desc';
@@ -370,15 +381,16 @@ async function advanceLocation(ctx, session, loc) {
 async function askIntroChoice(ctx, session, countryName) {
   const chatId = ctx.chat.id;
   try {
-    const suggestions = await suggestCountryIntro(countryName, 3);
+    const { suggestions, costUsd } = await suggestCountryIntro(countryName, 3);
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingIntros = suggestions;
+    session.aiCostUsd = (session.aiCostUsd || 0) + (costUsd || 0);
     session.step = 'await_intro_choice';
     await setSession(chatId, session);
     const rows = suggestions.map((s, i) => [{ text: s.es, callback_data: `intro:${i}` }]);
     rows.push([{ text: '✏️ Escribir la mía', callback_data: 'intro:own' }]);
     return ctx.reply(
-      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:`,
+      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:${costNote(costUsd)}`,
       { reply_markup: { inline_keyboard: rows } }
     );
   } catch (err) {
@@ -868,9 +880,11 @@ bot.on('text', async (ctx) => {
       const loc = findPhotoLocation(siteData, session.editPhotoId);
       if (!loc) throw new Error('Ya no encuentro esa foto.');
       loc.photo.caption = text;
+      let costUsd = null;
       try {
-        const captionEn = await translateToEnglish(text);
-        if (captionEn) loc.photo.captionEn = captionEn;
+        const translated = await translateToEnglish(text);
+        costUsd = translated.costUsd;
+        if (translated.text) loc.photo.captionEn = translated.text;
         else delete loc.photo.captionEn;
       } catch (err) {
         console.error('Error traduciendo caption editado:', err);
@@ -878,7 +892,7 @@ bot.on('text', async (ctx) => {
       }
       await commitSiteData(siteData, sha, `✏️ Editado: título -> "${text}"`);
       await clearSession(chatId);
-      return ctx.reply('✅ Título actualizado.');
+      return ctx.reply(`✅ Título actualizado.${costNote(costUsd)}`);
     } catch (err) {
       console.error('Error editando título:', err);
       return ctx.reply('❌ No pude actualizarlo: ' + err.message);
@@ -976,7 +990,9 @@ bot.on('text', async (ctx) => {
     // "-" para "dejarla igual" literalmente copiaba el español sin traducir
     // nada (así quedó "Templos y neblina." también en la versión inglesa).
     try {
-      session.descEn = await translateToEnglish(text);
+      const translated = await translateToEnglish(text);
+      session.descEn = translated.text;
+      session.aiCostUsd = (session.aiCostUsd || 0) + (translated.costUsd || 0);
     } catch (err) {
       console.error('Error traduciendo descripción de país:', err);
       session.descEn = text; // mejor mostrar el español que romper el flujo
@@ -1136,8 +1152,9 @@ async function finalize(ctx, session) {
       // inglés). Si falla la traducción no bloqueamos la subida — el sitio
       // ya cae solo al español si no encuentra captionEn.
       try {
-        const captionEn = await translateToEnglish(session.captions[i]);
-        if (captionEn) photoEntry.captionEn = captionEn;
+        const translated = await translateToEnglish(session.captions[i]);
+        if (translated.text) photoEntry.captionEn = translated.text;
+        session.aiCostUsd = (session.aiCostUsd || 0) + (translated.costUsd || 0);
       } catch (err) {
         console.error('Error traduciendo caption:', err);
       }
@@ -1218,7 +1235,7 @@ async function finalize(ctx, session) {
     // con la siguiente en vez de cerrar acá — el usuario no tiene que
     // reenviar nada, sigue solo.
     if (session.albumQueue && session.albumQueue.length > 0) {
-      await ctx.reply(`✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.`);
+      await ctx.reply(`✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${costNote(session.aiCostUsd)}`);
       const [nextFileId, ...rest] = session.albumQueue;
       return startNextAlbumItem(ctx, chatId, nextFileId, rest, session.albumTotal);
     }
@@ -1228,7 +1245,8 @@ async function finalize(ctx, session) {
     await ctx.reply(
       `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${albumDone}\n` +
         `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.\n\n` +
-        `(¿Te equivocaste? Mandá /undo para deshacerlo${session.albumTotal ? ' de esta última' : ''}.)`
+        `(¿Te equivocaste? Mandá /undo para deshacerlo${session.albumTotal ? ' de esta última' : ''}.)` +
+        `${costNote(session.aiCostUsd)}`
     );
   } catch (err) {
     console.error(err);
