@@ -958,6 +958,23 @@ bot.on('location', async (ctx) => {
   });
 });
 
+// Si mandás una foto "como archivo" (sin comprimir — lo que conviene para
+// imprimir, porque bot.on('photo') siempre recibe la versión comprimida de
+// Telegram, nunca el original), o un video, sticker, audio, etc., antes no
+// pasaba NADA — el bot se quedaba mudo y parecía roto. Avisamos qué mandar
+// en cambio. (Soportar el archivo sin comprimir de verdad es más laburo —
+// queda en la lista de pendientes, no es un fix de una línea.)
+bot.on(['document', 'video', 'video_note', 'animation', 'sticker', 'voice', 'audio'], async (ctx) => {
+  const isImageDoc = ctx.message.document && /^image\//.test(ctx.message.document.mime_type || '');
+  if (isImageDoc) {
+    return ctx.reply(
+      '📎 Recibí la foto como archivo (sin comprimir) — todavía no puedo procesarla así. ' +
+        'Mandala como foto normal de Telegram (sin el clip 📎), comprimida está bien.'
+    );
+  }
+  return ctx.reply('Por ahora solo puedo procesar fotos (y su ubicación/texto de respuesta) — mandame una foto para empezar.');
+});
+
 // Después de la ubicación (compartida o saltada), sigue el flujo normal:
 // - país nuevo: pide la descripción de intro, y después la categoría (opcional).
 // - país existente: pregunta directo la categoría (opcional).
