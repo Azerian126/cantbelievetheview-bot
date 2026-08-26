@@ -12,6 +12,7 @@ const {
   saveLastUpload,
   getLastUpload,
   clearLastUpload,
+  resetAllPhotoKeys,
 } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
@@ -45,6 +46,7 @@ bot.telegram
     { command: 'recientes', description: 'Últimas fotos subidas' },
     { command: 'progreso', description: 'Resumen de países y categorías' },
     { command: 'creditos', description: 'Saldo restante en xAI' },
+    { command: 'resetcontent', description: 'Borrar en Redis restos de fotos ya eliminadas' },
   ])
   .catch((err) => console.error('No pude registrar los comandos en Telegram:', err));
 
@@ -250,6 +252,28 @@ bot.command('undo', async (ctx) => {
     console.error('Error deshaciendo:', err);
     return ctx.reply('❌ No pude deshacerlo: ' + err.message);
   }
+});
+
+// Reset de emergencia — borra en Redis todo lo que quedó de fotos ya
+// eliminadas de data.json y de Cloudinary a mano (URLs limpias, derivadas
+// de impresión, hashes de duplicados, sesiones y "último subido" a
+// medias). Uso puntual, no es parte del flujo normal — de ahí la
+// confirmación explícita. No toca data.json ni Cloudinary, eso se maneja
+// aparte (ver backups/reset-2026-08-26.json en el repo de sitio/).
+bot.command('resetcontent', async (ctx) => {
+  return ctx.reply(
+    '⚠️ Esto borra en Redis TODAS las claves de fotos (URLs limpias, derivadas de impresión, hashes de ' +
+      'duplicados) y cualquier sesión o "último subido" a medias — de cualquier foto, no solo de una en ' +
+      'particular. No toca data.json ni Cloudinary. No se puede deshacer.\n\n¿Confirmás?',
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '⚠️ Sí, borrar todo en Redis', callback_data: 'resetcontent:confirm' }],
+          [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
+        ],
+      },
+    }
+  );
 });
 
 // --- 1. llega una foto -------------------------------------------------------
@@ -675,6 +699,24 @@ bot.on('callback_query', async (ctx) => {
     await clearSession(chatId);
     await ctx.answerCbQuery('Cancelado');
     return ctx.editMessageText('Cancelado. Mandame otra foto cuando quieras.');
+  }
+
+  // Confirmación de /resetcontent — no depende de ninguna sesión de subida
+  // en curso (de hecho, la borra), así que se resuelve ANTES del chequeo
+  // de sesión de acá abajo, igual que 'cancel'.
+  if (data === 'resetcontent:confirm') {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('Borrando…');
+    try {
+      const { total, perPattern } = await resetAllPhotoKeys();
+      const detail = Object.entries(perPattern)
+        .map(([p, n]) => `${p} → ${n}`)
+        .join('\n');
+      return ctx.reply(`✅ Listo — ${total} claves borradas en Redis:\n${detail}`);
+    } catch (err) {
+      console.error('Error en /resetcontent:', err);
+      return ctx.reply('❌ Algo falló borrando Redis: ' + err.message);
+    }
   }
 
   const session = await getSession(chatId);
