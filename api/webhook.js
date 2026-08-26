@@ -14,7 +14,7 @@ const {
 } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
-const { suggestCaptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
+const { suggestDescriptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -249,60 +249,87 @@ const locationPrompt =
   '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación, escribí el nombre del lugar ' +
   '(ej. "Estambul" o "Torres Petronas") si no estás ahí parado, o mandá "Sin ubicación" si no la tenés.';
 
-// Grok mira la foto y sugiere títulos — Mario elige uno o escribe el suyo.
-// Si falla la generación (sin key, sin crédito, error de red), cae al modo
-// manual de siempre en vez de trabar el flujo.
-//
+// El título SIEMPRE lo escribe Mario a mano — sin sugerencias de IA, sin
+// menú. La IA solo se encarga de la descripción corta (ver askDescription).
 // Con álbum, se pide un título POR FOTO (no uno solo para todo el lote) —
 // session.captionIndex indica cuál toca ahora, y la foto en cuestión se
 // reenvía junto con la pregunta para que quede claro de cuál se habla (con
 // varias fotos juntas, "el título de la foto" a secas era ambiguo).
-async function askCaption(ctx, session) {
+async function askTitle(ctx, session) {
   const chatId = ctx.chat.id;
   const idx = session.captionIndex || 0;
   const fileId = session.fileIds[idx];
   const total = session.fileIds.length;
   const label = total > 1 ? `📸 Foto ${idx + 1} de ${total}\n` : '';
+  session.step = 'await_title';
+  await setSession(chatId, session);
+  return ctx.replyWithPhoto(fileId, { caption: `${label}¿Qué título le ponés a esta foto?` });
+}
+
+// Guarda el título tipeado y pasa a pedirle a la IA la descripción corta.
+async function advanceTitle(ctx, session, title) {
+  const chatId = ctx.chat.id;
+  session.titles = session.titles || [];
+  session.titles[session.captionIndex || 0] = title;
+  await setSession(chatId, session);
+  return askDescription(ctx, session);
+}
+
+// Grok mira la foto (con el título ya puesto, como contexto) y sugiere 3
+// descripciones cortas — Mario elige una, pide otra tanda más corta/más
+// larga, o escribe la suya. Si falla la generación (sin key, sin crédito,
+// error de red), cae al modo manual en vez de trabar el flujo.
+// `lengthHint` ('shorter'|'longer'|undefined) ajusta el pedido a Grok
+// cuando Mario tocó "🔄 Más corta"/"🔄 Más larga" sobre la tanda anterior.
+async function askDescription(ctx, session, lengthHint) {
+  const chatId = ctx.chat.id;
+  const idx = session.captionIndex || 0;
+  const fileId = session.fileIds[idx];
+  const title = session.titles[idx];
 
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
-    const suggestions = await suggestCaptions(fileLink.href, 3);
+    const suggestions = await suggestDescriptions(fileLink.href, title, 3, lengthHint);
     if (!suggestions.length) throw new Error('sin sugerencias');
-    session.pendingCaptions = suggestions;
-    session.step = 'await_caption_choice';
+    session.pendingDescriptions = suggestions;
+    session.step = 'await_desc_choice';
     await setSession(chatId, session);
-    const rows = suggestions.map((s, i) => [{ text: s, callback_data: `cap:${i}` }]);
-    rows.push([{ text: '✏️ Escribir el mío', callback_data: 'cap:own' }]);
-    return ctx.replyWithPhoto(fileId, {
-      caption: `${label}Elegí un título o escribí el tuyo:`,
-      reply_markup: { inline_keyboard: rows },
-    });
+    const rows = suggestions.map((s, i) => [{ text: s, callback_data: `desc:${i}` }]);
+    rows.push([
+      { text: '🔄 Más corta', callback_data: 'desc:shorter' },
+      { text: '🔄 Más larga', callback_data: 'desc:longer' },
+    ]);
+    rows.push([{ text: '✏️ Escribir la mía', callback_data: 'desc:own' }]);
+    return ctx.reply('Elegí una descripción corta o escribí la tuya:', { reply_markup: { inline_keyboard: rows } });
   } catch (err) {
-    console.error('Error generando títulos:', err);
-    session.step = 'await_caption';
+    console.error('Error generando descripciones:', err);
+    session.step = 'await_desc';
     await setSession(chatId, session);
-    return ctx.replyWithPhoto(fileId, {
-      caption: `${label}No pude generar sugerencias — mandame el título / descripción corta de esta foto (en español).`,
-    });
+    return ctx.reply('No pude generar descripciones — mandame una descripción corta de esta foto (en español).');
   }
 }
 
-// Guarda el título de la foto actual y pasa a la siguiente del lote (si
-// hay) o sigue el flujo normal (si ya se tituló todo).
-async function advanceCaption(ctx, session, caption) {
+// Guarda la descripción corta elegida, arma el caption final ("Título /
+// Descripción" — misma convención que ya separa el sitio en dos líneas,
+// ver .photo-title/.photo-desc en index.html) y pasa a la foto siguiente
+// del lote, o sigue el flujo normal si ya se completó todo.
+async function advanceDescription(ctx, session, description) {
   const chatId = ctx.chat.id;
+  const idx = session.captionIndex || 0;
+  const title = session.titles[idx];
   session.captions = session.captions || [];
-  session.captions[session.captionIndex || 0] = caption;
-  session.captionIndex = (session.captionIndex || 0) + 1;
+  session.captions[idx] = description ? `${title} / ${description}` : title;
+  delete session.pendingDescriptions;
+  session.captionIndex = idx + 1;
 
   if (session.captionIndex < session.fileIds.length) {
-    return askCaption(ctx, session);
+    return askTitle(ctx, session);
   }
   session.locationIndex = 0;
   return askLocation(ctx, session);
 }
 
-// Igual que askCaption pero para la ubicación: con álbum se pregunta UNA POR
+// Igual que askTitle/askDescription pero para la ubicación: con álbum se pregunta UNA POR
 // UNA (session.locationIndex), reposteando la foto en cuestión — antes se
 // preguntaba una sola vez para todo el lote y esa misma coordenada se le
 // pegaba a TODAS las fotos, aunque fueran de lugares distintos dentro del
@@ -338,7 +365,7 @@ async function advanceLocation(ctx, session, loc) {
   return afterLocation(ctx, session);
 }
 
-// Igual que askCaption pero para la intro de un país nuevo — no mira
+// Igual que askTitle/askDescription pero para la intro de un país nuevo — no mira
 // ninguna foto, solo el nombre del país.
 async function askIntroChoice(ctx, session, countryName) {
   const chatId = ctx.chat.id;
@@ -376,18 +403,26 @@ bot.command('back', async (ctx) => {
   }
 
   switch (session.step) {
-    case 'await_caption_choice':
-    case 'await_caption': {
-      delete session.pendingCaptions;
+    case 'await_desc_choice':
+    case 'await_desc':
+      // Volvés a la pregunta del TÍTULO de esta misma foto — la descripción
+      // que se haya sugerido/tipeado se descarta, el título se vuelve a
+      // pedir (aunque sea el mismo que ya habías puesto).
+      delete session.pendingDescriptions;
+      return askTitle(ctx, session);
+
+    case 'await_title': {
       const idx = session.captionIndex || 0;
       if (idx > 0) {
-        // Álbum: volvés a la foto ANTERIOR del lote, no a elegir país de nuevo.
+        // Álbum: volvés al título de la foto ANTERIOR del lote.
         session.captionIndex = idx - 1;
         if (session.captions) session.captions.pop();
-        return askCaption(ctx, session);
+        if (session.titles) session.titles.pop();
+        return askTitle(ctx, session);
       }
       delete session.target;
       delete session.captions;
+      delete session.titles;
       delete session.captionIndex;
       session.step = 'await_country';
       await setSession(chatId, session);
@@ -407,14 +442,14 @@ bot.command('back', async (ctx) => {
         if (session.locations) session.locations.pop();
         return askLocation(ctx, session);
       }
-      // Ya estás en la primera foto — volvés a preguntar el título de la
-      // última foto del lote, para poder corregirlo.
+      // Ya estás en la primera foto — volvés a la descripción de la última
+      // foto del lote (el título de esa foto se mantiene tal cual).
       delete session.locations;
       delete session.locationIndex;
       const lastIdx = session.fileIds.length - 1;
       session.captionIndex = lastIdx;
       if (session.captions) session.captions.splice(lastIdx, 1);
-      return askCaption(ctx, session);
+      return askDescription(ctx, session);
     }
 
     case 'await_intro_choice':
@@ -688,7 +723,7 @@ bot.on('callback_query', async (ctx) => {
     const country = (isNew ? siteData.visitedEmpty : siteData.visited).find((c) => c.key === key);
     session.target = { type: isNew ? 'country_new' : 'country_existing', key };
     await ctx.editMessageText(`País: ${country ? country.name : key} ✅`);
-    return askCaption(ctx, session);
+    return askTitle(ctx, session);
   }
 
   // Elegir categoría cuando la foto no tiene país (ej. Modelos).
@@ -697,7 +732,7 @@ bot.on('callback_query', async (ctx) => {
     await ctx.answerCbQuery();
     session.target = { type: 'category', key };
     await ctx.editMessageText('Categoría marcada ✅ (sin país)');
-    return askCaption(ctx, session);
+    return askTitle(ctx, session);
   }
 
   // Tag opcional de categoría temática para una foto que SÍ tiene país.
@@ -748,25 +783,26 @@ bot.on('callback_query', async (ctx) => {
     return advanceLocation(ctx, session, { lat: place.lat, lng: place.lng });
   }
 
-  // Eligió uno de los títulos que sugirió Grok mirando la foto (el mensaje
-  // es una foto con caption, no texto plano — se edita distinto).
-  if (data.startsWith('cap:')) {
+  // Eligió una de las descripciones cortas que sugirió Grok, pidió otra
+  // tanda más corta/más larga, o prefiere escribir la suya.
+  if (data.startsWith('desc:')) {
     await ctx.answerCbQuery();
-    if (data === 'cap:own') {
-      delete session.pendingCaptions;
-      session.step = 'await_caption';
+    if (data === 'desc:own') {
+      delete session.pendingDescriptions;
+      session.step = 'await_desc';
       await setSession(chatId, session);
-      const idx = session.captionIndex || 0;
-      const total = session.fileIds.length;
-      const label = total > 1 ? `📸 Foto ${idx + 1} de ${total}\n` : '';
-      return ctx.editMessageCaption(`${label}Mandame el título / descripción corta de esta foto (en español).`);
+      return ctx.editMessageText('Mandame una descripción corta de esta foto (en español).');
     }
-    const idx = parseInt(data.slice('cap:'.length), 10);
-    const caption = session.pendingCaptions && session.pendingCaptions[idx];
-    if (!caption) return ctx.editMessageCaption('Esa opción ya venció — escribí el título a mano.');
-    delete session.pendingCaptions;
-    await ctx.editMessageCaption(`Título: "${caption}" ✅`);
-    return advanceCaption(ctx, session, caption);
+    if (data === 'desc:shorter' || data === 'desc:longer') {
+      await ctx.editMessageText(data === 'desc:shorter' ? 'Dale, más corta...' : 'Dale, más larga...');
+      return askDescription(ctx, session, data === 'desc:shorter' ? 'shorter' : 'longer');
+    }
+    const idx = parseInt(data.slice('desc:'.length), 10);
+    const description = session.pendingDescriptions && session.pendingDescriptions[idx];
+    if (!description) return ctx.editMessageText('Esa opción ya venció — escribí la descripción a mano.');
+    delete session.pendingDescriptions;
+    await ctx.editMessageText(`Descripción: "${description}" ✅`);
+    return advanceDescription(ctx, session, description);
   }
 
   // Eligió una de las intros que sugirió Grok para el país nuevo.
@@ -818,8 +854,8 @@ bot.on('text', async (ctx) => {
     return ctx.reply('Tocá "✅ Confirmar y subir", o /back si algo está mal.');
   }
 
-  if (session.step === 'await_caption_choice') {
-    return ctx.reply('Tocá uno de los títulos de arriba, o "✏️ Escribir el mío" para escribir el tuyo.');
+  if (session.step === 'await_desc_choice') {
+    return ctx.reply('Tocá una de las descripciones de arriba, o "✏️ Escribir la mía" para escribir la tuya.');
   }
 
   if (session.step === 'await_edit_select' || session.step === 'await_edit_action') {
@@ -870,7 +906,7 @@ bot.on('text', async (ctx) => {
     if (catMatch) {
       session.target = { type: 'category', key: catMatch.key };
       await ctx.reply(`Categoría: ${catMatch.name} ✅ (sin país)`);
-      return askCaption(ctx, session);
+      return askTitle(ctx, session);
     }
 
     // 3) nombre de país, tolerando errores de tipeo/acentos.
@@ -884,15 +920,19 @@ bot.on('text', async (ctx) => {
     if (matches.length === 1 && matches[0].distance === 0) {
       session.target = { type: matches[0].isNew ? 'country_new' : 'country_existing', key: matches[0].key };
       await ctx.reply(`País: ${matches[0].name} ✅`);
-      return askCaption(ctx, session);
+      return askTitle(ctx, session);
     }
     const rows = matches.map((m) => [{ text: `${m.isNew ? '⚪' : '🟡'} ${m.name}`, callback_data: `country:${m.key}` }]);
     rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
     return ctx.reply(`¿A cuál país te referís con "${text}"?`, { reply_markup: { inline_keyboard: rows } });
   }
 
-  if (session.step === 'await_caption') {
-    return advanceCaption(ctx, session, text);
+  if (session.step === 'await_title') {
+    return advanceTitle(ctx, session, text);
+  }
+
+  if (session.step === 'await_desc') {
+    return advanceDescription(ctx, session, text);
   }
 
   if (session.step === 'await_location') {
