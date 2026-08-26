@@ -5,6 +5,7 @@ const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl } = require('../lib/cloudinary');
 const { saveCleanUrl } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
+const { geocodePlace } = require('../lib/geocode');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -166,22 +167,40 @@ bot.on('text', async (ctx) => {
     session.step = 'await_location';
     await setSession(chatId, session);
     return ctx.reply(
-      '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación (elegís el punto en el mapa ' +
-        'de Telegram), o mandá "Sin ubicación" si no la tenés.',
+      '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación, escribí el nombre del lugar ' +
+        '(ej. "Estambul" o "Torres Petronas") si no estás ahí parado, o mandá "Sin ubicación" si no la tenés.',
       locationKeyboard
     );
   }
 
   if (session.step === 'await_location') {
     if (text === 'Sin ubicación') return afterLocation(ctx, session);
-    // Este paso solo entiende el botón de GPS o "Sin ubicación" — cualquier
-    // otro texto (ej. una descripción del lugar) antes se descartaba en
-    // silencio, dejando la sensación de que el bot no respondía.
-    return ctx.reply(
-      'Para la ubicación tocá "📍 Compartir ubicación" (elegís el punto en el mapa de Telegram) o mandá ' +
-        '"Sin ubicación" si no la tenés — ese texto no lo puedo usar como coordenada.',
-      locationKeyboard
-    );
+
+    // No es el botón de GPS ni "Sin ubicación" — probamos buscarlo como
+    // nombre de lugar (geocoding) antes de rendirnos. Cubre el caso de
+    // subir una foto vieja de un viaje pasado, donde compartir el GPS
+    // actual no tiene sentido.
+    try {
+      const place = await geocodePlace(text);
+      if (!place) {
+        return ctx.reply(
+          `No encontré "${text}" como lugar. Probá con otro nombre (ej. "Estambul" en vez de "el puente ese"), ` +
+            'tocá "📍 Compartir ubicación", o mandá "Sin ubicación" si no aplica.',
+          locationKeyboard
+        );
+      }
+      session.lat = place.lat;
+      session.lng = place.lng;
+      await ctx.reply(`Ubicación: ${place.displayName} ✅`, Markup.removeKeyboard());
+      return afterLocation(ctx, session);
+    } catch (err) {
+      console.error('Error geocodificando:', err);
+      return ctx.reply(
+        'No pude buscar ese lugar (falló el servicio de mapas) — probá de nuevo, tocá "📍 Compartir ' +
+          'ubicación", o mandá "Sin ubicación".',
+        locationKeyboard
+      );
+    }
   }
 
   if (session.step === 'await_desc_es') {
