@@ -15,6 +15,7 @@ const {
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
 const { suggestDescriptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
+const { getRemainingCredits } = require('../lib/xaiBilling');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -42,6 +43,7 @@ bot.telegram
     { command: 'editar', description: 'Editar una foto ya publicada' },
     { command: 'recientes', description: 'Últimas fotos subidas' },
     { command: 'progreso', description: 'Resumen de países y categorías' },
+    { command: 'creditos', description: 'Saldo restante en xAI' },
   ])
   .catch((err) => console.error('No pude registrar los comandos en Telegram:', err));
 
@@ -73,7 +75,7 @@ bot.start((ctx) =>
       'ej. Modelos). En un rato queda publicada en cantbelievetheview.com.\n\n' +
       'En cualquier momento: /back para volver un paso atrás, /cancel para cortar todo.\n' +
       '/undo deshace la última subida. /editar corrige cualquier foto ya publicada. ' +
-      '/recientes y /progreso muestran cómo va el sitio.'
+      '/recientes y /progreso muestran cómo va el sitio. /creditos muestra el saldo en xAI.'
   )
 );
 
@@ -133,6 +135,21 @@ bot.command('progreso', async (ctx) => {
     ...catLines,
   ];
   return ctx.reply(lines.join('\n'));
+});
+
+// Saldo prepago de xAI — necesita XAI_MANAGEMENT_KEY y XAI_TEAM_ID cargados
+// aparte (no es la misma key que usa el resto del bot para generar texto).
+bot.command('creditos', async (ctx) => {
+  try {
+    const balance = await getRemainingCredits();
+    return ctx.reply(`💳 Créditos xAI restantes: $${balance.toFixed(2)}`);
+  } catch (err) {
+    console.error('Error consultando créditos de xAI:', err);
+    return ctx.reply(
+      '❌ No pude consultar el saldo — revisá que XAI_MANAGEMENT_KEY y XAI_TEAM_ID estén cargados en Vercel.\n' +
+        `(${err.message})`
+    );
+  }
 });
 
 // Encuentra dónde vive una foto ya subida (país o categoría) — a diferencia
