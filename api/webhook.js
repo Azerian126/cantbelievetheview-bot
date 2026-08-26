@@ -298,9 +298,44 @@ async function advanceCaption(ctx, session, caption) {
   if (session.captionIndex < session.fileIds.length) {
     return askCaption(ctx, session);
   }
+  session.locationIndex = 0;
+  return askLocation(ctx, session);
+}
+
+// Igual que askCaption pero para la ubicación: con álbum se pregunta UNA POR
+// UNA (session.locationIndex), reposteando la foto en cuestión — antes se
+// preguntaba una sola vez para todo el lote y esa misma coordenada se le
+// pegaba a TODAS las fotos, aunque fueran de lugares distintos dentro del
+// mismo país (ej. dos monumentos distintos en Estambul).
+async function askLocation(ctx, session) {
+  const chatId = ctx.chat.id;
+  const idx = session.locationIndex || 0;
+  const fileId = session.fileIds[idx];
+  const total = session.fileIds.length;
   session.step = 'await_location';
   await setSession(chatId, session);
+  if (total > 1) {
+    const label = `📍 Foto ${idx + 1} de ${total}\n`;
+    return ctx.replyWithPhoto(fileId, { caption: `${label}${locationPrompt}`, ...locationKeyboard });
+  }
   return ctx.reply(locationPrompt, locationKeyboard);
+}
+
+// Guarda la ubicación (o null, si no aplica) de la foto actual y pasa a la
+// siguiente del lote — o sigue el flujo normal si ya se le preguntó a todas.
+async function advanceLocation(ctx, session, loc) {
+  const chatId = ctx.chat.id;
+  session.locations = session.locations || [];
+  session.locations[session.locationIndex || 0] = loc;
+  session.locationIndex = (session.locationIndex || 0) + 1;
+
+  if (session.locationIndex < session.fileIds.length) {
+    return askLocation(ctx, session);
+  }
+  delete session.pendingPlaces;
+  const anyLoc = session.locations.some((l) => l);
+  await ctx.reply(anyLoc ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.', Markup.removeKeyboard());
+  return afterLocation(ctx, session);
 }
 
 // Igual que askCaption pero para la intro de un país nuevo — no mira
@@ -365,8 +400,17 @@ bot.command('back', async (ctx) => {
       return ctx.reply(askCountryText);
 
     case 'await_location': {
-      // Vuelve a preguntar el título de la última foto del lote, para
-      // poder corregirlo.
+      const locIdx = session.locationIndex || 0;
+      if (locIdx > 0) {
+        // Álbum: volvés a la ubicación de la foto ANTERIOR del lote.
+        session.locationIndex = locIdx - 1;
+        if (session.locations) session.locations.pop();
+        return askLocation(ctx, session);
+      }
+      // Ya estás en la primera foto — volvés a preguntar el título de la
+      // última foto del lote, para poder corregirlo.
+      delete session.locations;
+      delete session.locationIndex;
       const lastIdx = session.fileIds.length - 1;
       session.captionIndex = lastIdx;
       if (session.captions) session.captions.splice(lastIdx, 1);
@@ -374,15 +418,15 @@ bot.command('back', async (ctx) => {
     }
 
     case 'await_intro_choice':
-    case 'await_desc_es':
+    case 'await_desc_es': {
       delete session.descEs;
       delete session.descEn;
       delete session.pendingIntros;
-      delete session.lat;
-      delete session.lng;
-      session.step = 'await_location';
-      await setSession(chatId, session);
-      return ctx.reply(locationPrompt, locationKeyboard);
+      const lastIdx = session.fileIds.length - 1;
+      session.locationIndex = lastIdx;
+      if (session.locations) session.locations.splice(lastIdx, 1);
+      return askLocation(ctx, session);
+    }
 
     case 'await_desc_en':
       session.step = 'await_desc_es';
@@ -398,20 +442,18 @@ bot.command('back', async (ctx) => {
         const country = siteData.visitedEmpty.find((c) => c.key === session.target.key);
         return askIntroChoice(ctx, session, country ? country.name : session.target.key);
       }
-      delete session.lat;
-      delete session.lng;
-      session.step = 'await_location';
-      await setSession(chatId, session);
-      return ctx.reply(locationPrompt, locationKeyboard);
+      const lastIdx1 = session.fileIds.length - 1;
+      session.locationIndex = lastIdx1;
+      if (session.locations) session.locations.splice(lastIdx1, 1);
+      return askLocation(ctx, session);
     }
 
     case 'await_final_confirm':
       if (session.target.type === 'category') {
-        delete session.lat;
-        delete session.lng;
-        session.step = 'await_location';
-        await setSession(chatId, session);
-        return ctx.reply(locationPrompt, locationKeyboard);
+        const lastIdx2 = session.fileIds.length - 1;
+        session.locationIndex = lastIdx2;
+        if (session.locations) session.locations.splice(lastIdx2, 1);
+        return askLocation(ctx, session);
       }
       return askCategoryTag(ctx, session);
 
@@ -693,11 +735,9 @@ bot.on('callback_query', async (ctx) => {
   // de la sesión (foto, país, título ya elegidos siguen en pie).
   if (data === 'loc:retry') {
     delete session.pendingPlaces;
-    session.step = 'await_location';
-    await setSession(chatId, session);
     await ctx.answerCbQuery();
     await ctx.editMessageText('Ok, probemos de nuevo.');
-    return ctx.reply(locationPrompt, locationKeyboard);
+    return askLocation(ctx, session);
   }
 
   // Eligió una de las opciones de lugar que encontró el geocoding.
@@ -708,12 +748,9 @@ bot.on('callback_query', async (ctx) => {
     if (!place) {
       return ctx.editMessageText('Esa opción ya venció — escribí el lugar de nuevo.');
     }
-    session.lat = place.lat;
-    session.lng = place.lng;
     delete session.pendingPlaces;
-    await setSession(chatId, session);
     await ctx.editMessageText(`Ubicación: ${place.displayName} ✅`);
-    return afterLocation(ctx, session);
+    return advanceLocation(ctx, session, { lat: place.lat, lng: place.lng });
   }
 
   // Eligió uno de los títulos que sugirió Grok mirando la foto (el mensaje
@@ -856,7 +893,7 @@ bot.on('text', async (ctx) => {
   }
 
   if (session.step === 'await_location') {
-    if (text === 'Sin ubicación') return afterLocation(ctx, session);
+    if (text === 'Sin ubicación') return advanceLocation(ctx, session, null);
 
     // No es el botón de GPS ni "Sin ubicación" — probamos buscarlo como
     // nombre de lugar (geocoding) antes de rendirnos. Cubre el caso de
@@ -910,9 +947,10 @@ bot.on('location', async (ctx) => {
   const session = await getSession(chatId);
   if (!session || session.step !== 'await_location') return;
 
-  session.lat = ctx.message.location.latitude;
-  session.lng = ctx.message.location.longitude;
-  return afterLocation(ctx, session);
+  return advanceLocation(ctx, session, {
+    lat: ctx.message.location.latitude,
+    lng: ctx.message.location.longitude,
+  });
 });
 
 // Después de la ubicación (compartida o saltada), sigue el flujo normal:
@@ -921,20 +959,11 @@ bot.on('location', async (ctx) => {
 // - sin país (ej. Modelos): finaliza directo, no aplica el tag de categoría
 //   porque ya está implícito en la categoría elegida al principio.
 async function afterLocation(ctx, session) {
-  const chatId = ctx.chat.id;
   if (session.target.type === 'country_new') {
-    await ctx.reply(
-      session.lat !== undefined ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.',
-      Markup.removeKeyboard()
-    );
     const { json: siteData } = await getSiteData();
     const country = siteData.visitedEmpty.find((c) => c.key === session.target.key);
     return askIntroChoice(ctx, session, country ? country.name : session.target.key);
   }
-  await ctx.reply(
-    session.lat !== undefined ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.',
-    Markup.removeKeyboard()
-  );
   if (session.target.type === 'country_existing') {
     return askCategoryTag(ctx, session);
   }
@@ -988,7 +1017,16 @@ async function askFinalConfirm(ctx, session) {
   } else {
     lines.push(`📝 "${session.captions[0]}"`);
   }
-  if (session.lat !== undefined) lines.push(`🗺 ${session.lat.toFixed(4)}, ${session.lng.toFixed(4)}`);
+  if (session.locations && session.locations.some((l) => l)) {
+    if (session.captions.length > 1) {
+      session.locations.forEach((l, i) => {
+        if (l) lines.push(`🗺 Foto ${i + 1}: ${l.lat.toFixed(4)}, ${l.lng.toFixed(4)}`);
+      });
+    } else {
+      const l = session.locations[0];
+      lines.push(`🗺 ${l.lat.toFixed(4)}, ${l.lng.toFixed(4)}`);
+    }
+  }
   if (session.descEs) lines.push(`✍️ Intro del país: "${session.descEs}"`);
   lines.push('', '¿Confirmás?');
 
@@ -1034,9 +1072,11 @@ async function finalize(ctx, session) {
       // Solo le agregamos lat/lng a la foto si de verdad la compartiste —
       // así el sitio sabe que es una coordenada real (si no, la galería se
       // la inventa aproximada a partir del país/categoría, como ya hacía).
-      if (session.lat !== undefined) {
-        photoEntry.lat = session.lat;
-        photoEntry.lng = session.lng;
+      // Es POR FOTO — no se le pega la misma ubicación a todo el lote.
+      const loc = session.locations && session.locations[i];
+      if (loc) {
+        photoEntry.lat = loc.lat;
+        photoEntry.lng = loc.lng;
       }
       // Tag opcional de categoría temática — solo aplica a fotos de país
       // (la rama "category" de abajo, ej. Modelos, ya está tagueada por
