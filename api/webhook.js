@@ -14,7 +14,7 @@ const {
 } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
-const { suggestCaptions, suggestCountryIntro } = require('../lib/grokText');
+const { suggestCaptions, suggestCountryIntro, translateCaption } = require('../lib/grokText');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -837,6 +837,14 @@ bot.on('text', async (ctx) => {
       const loc = findPhotoLocation(siteData, session.editPhotoId);
       if (!loc) throw new Error('Ya no encuentro esa foto.');
       loc.photo.caption = text;
+      try {
+        const captionEn = await translateCaption(text);
+        if (captionEn) loc.photo.captionEn = captionEn;
+        else delete loc.photo.captionEn;
+      } catch (err) {
+        console.error('Error traduciendo caption editado:', err);
+        delete loc.photo.captionEn; // mejor sin traducción que con una vieja desactualizada
+      }
       await commitSiteData(siteData, sha, `✏️ Editado: título -> "${text}"`);
       await clearSession(chatId);
       return ctx.reply('✅ Título actualizado.');
@@ -1069,6 +1077,16 @@ async function finalize(ctx, session) {
       await saveCleanUrl(photoId, cleanUrl);
 
       const photoEntry = { id: photoId, displayUrl, caption: session.captions[i] };
+      // Traducción al inglés del título — sin esto, el sitio en inglés
+      // mostraba el título en español tal cual (nunca había campo para el
+      // inglés). Si falla la traducción no bloqueamos la subida — el sitio
+      // ya cae solo al español si no encuentra captionEn.
+      try {
+        const captionEn = await translateCaption(session.captions[i]);
+        if (captionEn) photoEntry.captionEn = captionEn;
+      } catch (err) {
+        console.error('Error traduciendo caption:', err);
+      }
       // Solo le agregamos lat/lng a la foto si de verdad la compartiste —
       // así el sitio sabe que es una coordenada real (si no, la galería se
       // la inventa aproximada a partir del país/categoría, como ya hacía).
