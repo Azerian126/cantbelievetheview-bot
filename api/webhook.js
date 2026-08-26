@@ -6,6 +6,7 @@ const { uploadFromUrl, downloadBuffer, hashBuffer } = require('../lib/cloudinary
 const { saveCleanUrl, findByHash, saveHash } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces } = require('../lib/geocode');
+const { suggestCaptions, suggestCountryIntro } = require('../lib/grokText');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -44,7 +45,8 @@ bot.use(async (ctx, next) => {
 bot.start((ctx) =>
   ctx.reply(
     'Mandame una foto y te pregunto de qué país es (o "sin ubicación" si no aplica, ej. Modelos). ' +
-      'En un rato queda publicada en cantbelievetheview.com.'
+      'En un rato queda publicada en cantbelievetheview.com.\n\n' +
+      'En cualquier momento: /back para volver un paso atrás, /cancel para cortar todo.'
   )
 );
 
@@ -70,6 +72,125 @@ function shortenPlace(name, max = 60) {
 
 const askCountryText =
   '¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).';
+
+const locationPrompt =
+  '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación, escribí el nombre del lugar ' +
+  '(ej. "Estambul" o "Torres Petronas") si no estás ahí parado, o mandá "Sin ubicación" si no la tenés.';
+
+// Grok mira la foto y sugiere títulos — Mario elige uno o escribe el suyo.
+// Si falla la generación (sin key, sin crédito, error de red), cae al modo
+// manual de siempre en vez de trabar el flujo.
+async function askCaption(ctx, session) {
+  const chatId = ctx.chat.id;
+  try {
+    const fileLink = await ctx.telegram.getFileLink(session.fileId);
+    const suggestions = await suggestCaptions(fileLink.href, 3);
+    if (!suggestions.length) throw new Error('sin sugerencias');
+    session.pendingCaptions = suggestions;
+    session.step = 'await_caption_choice';
+    await setSession(chatId, session);
+    const rows = suggestions.map((s, i) => [{ text: s, callback_data: `cap:${i}` }]);
+    rows.push([{ text: '✏️ Escribir el mío', callback_data: 'cap:own' }]);
+    return ctx.reply('Elegí un título o escribí el tuyo:', { reply_markup: { inline_keyboard: rows } });
+  } catch (err) {
+    console.error('Error generando títulos:', err);
+    session.step = 'await_caption';
+    await setSession(chatId, session);
+    return ctx.reply('No pude generar sugerencias — mandame el título / descripción corta de la foto (en español).');
+  }
+}
+
+// Igual que askCaption pero para la intro de un país nuevo — no mira
+// ninguna foto, solo el nombre del país.
+async function askIntroChoice(ctx, session, countryName) {
+  const chatId = ctx.chat.id;
+  try {
+    const suggestions = await suggestCountryIntro(countryName, 3);
+    if (!suggestions.length) throw new Error('sin sugerencias');
+    session.pendingIntros = suggestions;
+    session.step = 'await_intro_choice';
+    await setSession(chatId, session);
+    const rows = suggestions.map((s, i) => [{ text: s.es, callback_data: `intro:${i}` }]);
+    rows.push([{ text: '✏️ Escribir la mía', callback_data: 'intro:own' }]);
+    return ctx.reply(
+      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:`,
+      { reply_markup: { inline_keyboard: rows } }
+    );
+  } catch (err) {
+    console.error('Error generando intro:', err);
+    session.step = 'await_desc_es';
+    await setSession(chatId, session);
+    return ctx.reply(
+      'Este país todavía no tiene galería — necesito una descripción corta de intro, en español ' +
+        '(ej: "Andes, niebla y ruinas incas al amanecer.").'
+    );
+  }
+}
+
+// "/back" retrocede un paso (a diferencia de "/cancel", que corta todo).
+// Lo que ya habías puesto en el paso del que volvés se descarta, como en
+// cualquier "atrás" — vas a tener que volver a contestarlo.
+bot.command('back', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const session = await getSession(chatId);
+  if (!session || !session.step) {
+    return ctx.reply('No hay nada para retroceder — mandame una foto para empezar.');
+  }
+
+  switch (session.step) {
+    case 'await_caption_choice':
+    case 'await_caption':
+      delete session.target;
+      delete session.pendingCaptions;
+      session.step = 'await_country';
+      await setSession(chatId, session);
+      return ctx.reply(askCountryText);
+
+    case 'await_no_country_category':
+      session.step = 'await_country';
+      await setSession(chatId, session);
+      return ctx.reply(askCountryText);
+
+    case 'await_location':
+      delete session.caption;
+      return askCaption(ctx, session);
+
+    case 'await_intro_choice':
+    case 'await_desc_es':
+      delete session.descEs;
+      delete session.descEn;
+      delete session.pendingIntros;
+      delete session.lat;
+      delete session.lng;
+      session.step = 'await_location';
+      await setSession(chatId, session);
+      return ctx.reply(locationPrompt, locationKeyboard);
+
+    case 'await_desc_en':
+      session.step = 'await_desc_es';
+      await setSession(chatId, session);
+      return ctx.reply('Mandame de nuevo la descripción en español.', Markup.removeKeyboard());
+
+    case 'await_category_tag': {
+      delete session.categoryKey;
+      if (session.target.type === 'country_new') {
+        delete session.descEs;
+        delete session.descEn;
+        const { json: siteData } = await getSiteData();
+        const country = siteData.visitedEmpty.find((c) => c.key === session.target.key);
+        return askIntroChoice(ctx, session, country ? country.name : session.target.key);
+      }
+      delete session.lat;
+      delete session.lng;
+      session.step = 'await_location';
+      await setSession(chatId, session);
+      return ctx.reply(locationPrompt, locationKeyboard);
+    }
+
+    default:
+      return ctx.reply('No puedo volver atrás desde acá — usá /cancel si querés arrancar de nuevo.');
+  }
+});
 
 bot.on('photo', async (ctx) => {
   const photos = ctx.message.photo;
@@ -131,10 +252,10 @@ bot.on('callback_query', async (ctx) => {
     await ctx.answerCbQuery();
     const { json: siteData } = await getSiteData();
     const isNew = siteData.visitedEmpty.some((c) => c.key === key);
+    const country = (isNew ? siteData.visitedEmpty : siteData.visited).find((c) => c.key === key);
     session.target = { type: isNew ? 'country_new' : 'country_existing', key };
-    session.step = 'await_caption';
-    await setSession(chatId, session);
-    return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
+    await ctx.editMessageText(`País: ${country ? country.name : key} ✅`);
+    return askCaption(ctx, session);
   }
 
   // Elegir categoría cuando la foto no tiene país (ej. Modelos).
@@ -142,9 +263,8 @@ bot.on('callback_query', async (ctx) => {
     const key = data.slice('sel:g:'.length);
     await ctx.answerCbQuery();
     session.target = { type: 'category', key };
-    session.step = 'await_caption';
-    await setSession(chatId, session);
-    return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
+    await ctx.editMessageText('Categoría marcada ✅ (sin país)');
+    return askCaption(ctx, session);
   }
 
   // Tag opcional de categoría temática para una foto que SÍ tiene país.
@@ -183,6 +303,48 @@ bot.on('callback_query', async (ctx) => {
     return afterLocation(ctx, session);
   }
 
+  // Eligió uno de los títulos que sugirió Grok mirando la foto.
+  if (data.startsWith('cap:')) {
+    await ctx.answerCbQuery();
+    if (data === 'cap:own') {
+      delete session.pendingCaptions;
+      session.step = 'await_caption';
+      await setSession(chatId, session);
+      return ctx.editMessageText('Mandame el título / descripción corta de la foto (en español).');
+    }
+    const idx = parseInt(data.slice('cap:'.length), 10);
+    const caption = session.pendingCaptions && session.pendingCaptions[idx];
+    if (!caption) return ctx.editMessageText('Esa opción ya venció — escribí el título a mano.');
+    session.caption = caption;
+    delete session.pendingCaptions;
+    session.step = 'await_location';
+    await setSession(chatId, session);
+    await ctx.editMessageText(`Título: "${caption}" ✅`);
+    return ctx.reply(locationPrompt, locationKeyboard);
+  }
+
+  // Eligió una de las intros que sugirió Grok para el país nuevo.
+  if (data.startsWith('intro:')) {
+    await ctx.answerCbQuery();
+    if (data === 'intro:own') {
+      delete session.pendingIntros;
+      session.step = 'await_desc_es';
+      await setSession(chatId, session);
+      return ctx.editMessageText(
+        'Necesito una descripción corta de intro, en español (ej: "Andes, niebla y ruinas incas al amanecer.").'
+      );
+    }
+    const idx = parseInt(data.slice('intro:'.length), 10);
+    const intro = session.pendingIntros && session.pendingIntros[idx];
+    if (!intro) return ctx.editMessageText('Esa opción ya venció — escribí la intro a mano.');
+    session.descEs = intro.es;
+    session.descEn = intro.en;
+    delete session.pendingIntros;
+    await setSession(chatId, session);
+    await ctx.editMessageText(`Intro: "${intro.es}" ✅`);
+    return askCategoryTag(ctx, session);
+  }
+
   return ctx.answerCbQuery();
 });
 
@@ -196,6 +358,14 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_duplicate_confirm') {
     return ctx.reply('Tocá uno de los botones de arriba (✅ Subir igual / ✖️ Cancelar) para seguir.');
+  }
+
+  if (session.step === 'await_caption_choice') {
+    return ctx.reply('Tocá uno de los títulos de arriba, o "✏️ Escribir el mío" para escribir el tuyo.');
+  }
+
+  if (session.step === 'await_intro_choice') {
+    return ctx.reply('Tocá una de las intros de arriba, o "✏️ Escribir la mía" para escribir la tuya.');
   }
 
   if (session.step === 'await_country') {
@@ -214,11 +384,8 @@ bot.on('text', async (ctx) => {
     const catMatch = findCategoryMatch(siteData, text);
     if (catMatch) {
       session.target = { type: 'category', key: catMatch.key };
-      session.step = 'await_caption';
-      await setSession(chatId, session);
-      return ctx.reply(
-        `Categoría: ${catMatch.name} ✅ (sin país)\nMandame el título / descripción corta de la foto (en español).`
-      );
+      await ctx.reply(`Categoría: ${catMatch.name} ✅ (sin país)`);
+      return askCaption(ctx, session);
     }
 
     // 3) nombre de país, tolerando errores de tipeo/acentos.
@@ -231,9 +398,8 @@ bot.on('text', async (ctx) => {
     }
     if (matches.length === 1 && matches[0].distance === 0) {
       session.target = { type: matches[0].isNew ? 'country_new' : 'country_existing', key: matches[0].key };
-      session.step = 'await_caption';
-      await setSession(chatId, session);
-      return ctx.reply(`País: ${matches[0].name} ✅\nMandame el título / descripción corta de la foto (en español).`);
+      await ctx.reply(`País: ${matches[0].name} ✅`);
+      return askCaption(ctx, session);
     }
     const rows = matches.map((m) => [{ text: `${m.isNew ? '⚪' : '🟡'} ${m.name}`, callback_data: `country:${m.key}` }]);
     rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
@@ -244,11 +410,7 @@ bot.on('text', async (ctx) => {
     session.caption = text;
     session.step = 'await_location';
     await setSession(chatId, session);
-    return ctx.reply(
-      '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación, escribí el nombre del lugar ' +
-        '(ej. "Estambul" o "Torres Petronas") si no estás ahí parado, o mandá "Sin ubicación" si no la tenés.',
-      locationKeyboard
-    );
+    return ctx.reply(locationPrompt, locationKeyboard);
   }
 
   if (session.step === 'await_location') {
@@ -317,13 +479,13 @@ bot.on('location', async (ctx) => {
 async function afterLocation(ctx, session) {
   const chatId = ctx.chat.id;
   if (session.target.type === 'country_new') {
-    session.step = 'await_desc_es';
-    await setSession(chatId, session);
-    return ctx.reply(
-      'Este país todavía no tiene galería — necesito una descripción corta de intro, en español ' +
-        '(ej: "Andes, niebla y ruinas incas al amanecer.").',
+    await ctx.reply(
+      session.lat !== undefined ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.',
       Markup.removeKeyboard()
     );
+    const { json: siteData } = await getSiteData();
+    const country = siteData.visitedEmpty.find((c) => c.key === session.target.key);
+    return askIntroChoice(ctx, session, country ? country.name : session.target.key);
   }
   await ctx.reply(
     session.lat !== undefined ? 'Ubicación guardada.' : 'Sin ubicación, seguimos.',
