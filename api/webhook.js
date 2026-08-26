@@ -28,6 +28,23 @@ const { suggestCaptions, suggestCountryIntro } = require('../lib/grokText');
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN, { telegram: { webhookReply: false } });
 const ALLOWED_ID = String(process.env.ALLOWED_TELEGRAM_ID || '');
 
+// Le avisa a Telegram cuáles son los comandos — así aparecen con
+// autocompletado en el botón "/" del cliente, en vez de tener que
+// acordarte de memoria cuáles existen. Se llama en cada cold start del
+// runtime de Vercel; es idempotente (Telegram simplemente reemplaza la
+// lista con la misma), así que no hace falta un script aparte.
+bot.telegram
+  .setMyCommands([
+    { command: 'start', description: 'Cómo funciona el bot' },
+    { command: 'back', description: 'Volver un paso atrás' },
+    { command: 'cancel', description: 'Cancelar todo' },
+    { command: 'undo', description: 'Deshacer la última subida' },
+    { command: 'editar', description: 'Editar una foto ya publicada' },
+    { command: 'recientes', description: 'Últimas fotos subidas' },
+    { command: 'progreso', description: 'Resumen de países y categorías' },
+  ])
+  .catch((err) => console.error('No pude registrar los comandos en Telegram:', err));
+
 // Frases que dicen "esta foto no tiene país" (ej. Modelos) — todo normalizado
 // (sin acentos, minúscula) porque se compara contra normalize(texto del usuario).
 const NO_COUNTRY_WORDS = ['sin ubicacion', 'ninguno', 'ninguna', 'no', 'n/a', 'na'];
@@ -55,7 +72,8 @@ bot.start((ctx) =>
     'Mandame una foto (o varias juntas) y te pregunto de qué país es (o "sin ubicación" si no aplica, ' +
       'ej. Modelos). En un rato queda publicada en cantbelievetheview.com.\n\n' +
       'En cualquier momento: /back para volver un paso atrás, /cancel para cortar todo.\n' +
-      '/undo deshace la última subida. /recientes muestra las últimas fotos subidas.'
+      '/undo deshace la última subida. /editar corrige cualquier foto ya publicada. ' +
+      '/recientes y /progreso muestran cómo va el sitio.'
   )
 );
 
@@ -87,6 +105,69 @@ bot.command('recientes', async (ctx) => {
 
   const lines = all.slice(0, 8).map((p) => `• "${p.caption}" — ${p.place}`);
   return ctx.reply(`Últimas ${lines.length} fotos:\n\n` + lines.join('\n'));
+});
+
+bot.command('progreso', async (ctx) => {
+  const { json: siteData } = await getSiteData();
+  const withPhotos = siteData.visited.filter((c) => (c.photos || []).length > 0);
+  const totalCountryPhotos = siteData.visited.reduce((n, c) => n + (c.photos || []).length, 0);
+
+  // Una categoría suma sus fotos propias (ej. Modelos, sin país) + las de
+  // países que la tengan tageada (categoryKey) — mismo criterio que
+  // photosForCategory() en el sitio, para que el número coincida con lo
+  // que realmente se ve en la galería de esa categoría.
+  const catLines = siteData.categories.map((cat) => {
+    const own = (cat.photos || []).length;
+    const tagged = siteData.visited.reduce(
+      (n, c) => n + (c.photos || []).filter((p) => p.categoryKey === cat.key).length,
+      0
+    );
+    return `  • ${cat.name}: ${own + tagged}`;
+  });
+
+  const lines = [
+    `🌍 Países con fotos: ${withPhotos.length} / ${siteData.visited.length + siteData.visitedEmpty.length}`,
+    `📸 Fotos totales: ${totalCountryPhotos}`,
+    '',
+    'Por categoría:',
+    ...catLines,
+  ];
+  return ctx.reply(lines.join('\n'));
+});
+
+// Encuentra dónde vive una foto ya subida (país o categoría) — a diferencia
+// de /undo, que solo conoce la última subida, esto busca cualquiera por id.
+function findPhotoLocation(siteData, photoId) {
+  for (const c of siteData.visited) {
+    const p = (c.photos || []).find((x) => x.id === photoId);
+    if (p) return { photo: p, targetType: 'country', targetKey: c.key, containerName: c.name };
+  }
+  for (const cat of siteData.categories) {
+    const p = (cat.photos || []).find((x) => x.id === photoId);
+    if (p) return { photo: p, targetType: 'category', targetKey: cat.key, containerName: cat.name };
+  }
+  return null;
+}
+
+// /editar — a diferencia de /undo (solo la última subida), esto deja
+// corregir cualquier foto ya publicada: cambiarle el título, la categoría
+// temática, o borrarla. Arranca mostrando las últimas 10 para elegir.
+bot.command('editar', async (ctx) => {
+  const { json: siteData } = await getSiteData();
+  const all = [];
+  siteData.visited.forEach((c) => (c.photos || []).forEach((p) => all.push({ ...p, place: c.name })));
+  siteData.categories.forEach((cat) => (cat.photos || []).forEach((p) => all.push({ ...p, place: cat.name })));
+  all.sort((a, b) => timestampFromPhotoId(b.id) - timestampFromPhotoId(a.id));
+
+  if (!all.length) return ctx.reply('Todavía no hay ninguna foto subida.');
+
+  const recent = all.slice(0, 10);
+  const rows = recent.map((p) => [
+    { text: shortenPlace(`${p.caption} — ${p.place}`, 60), callback_data: `edit:sel:${p.id}` },
+  ]);
+  rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
+  await setSession(ctx.chat.id, { step: 'await_edit_select' });
+  return ctx.reply('¿Cuál foto querés editar?', { reply_markup: { inline_keyboard: rows } });
 });
 
 // Deshace la última subida (por chat) — saca la(s) foto(s) de data.json, si
@@ -372,6 +453,104 @@ bot.on('callback_query', async (ctx) => {
     return ctx.editMessageText('Esta conversación ya expiró — mandame la foto de nuevo.');
   }
 
+  // --- /editar: eligió qué foto tocar, y qué hacerle -------------------------
+  if (data.startsWith('edit:sel:')) {
+    const photoId = data.slice('edit:sel:'.length);
+    await ctx.answerCbQuery();
+    const { json: siteData } = await getSiteData();
+    const loc = findPhotoLocation(siteData, photoId);
+    if (!loc) return ctx.editMessageText('No encontré esa foto — puede que ya se haya borrado.');
+    session.editPhotoId = photoId;
+    session.step = 'await_edit_action';
+    await setSession(chatId, session);
+    return ctx.editMessageText(`"${loc.photo.caption}" — ${loc.containerName}\n¿Qué querés hacer?`, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✏️ Cambiar título', callback_data: 'edit:caption' }],
+          [{ text: '🏷 Cambiar categoría', callback_data: 'edit:category' }],
+          [{ text: '🗑 Borrar', callback_data: 'edit:delete' }],
+          [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
+        ],
+      },
+    });
+  }
+
+  if (data === 'edit:caption') {
+    await ctx.answerCbQuery();
+    session.step = 'await_edit_caption';
+    await setSession(chatId, session);
+    return ctx.editMessageText('Mandame el nuevo título / descripción corta.');
+  }
+
+  if (data === 'edit:category') {
+    await ctx.answerCbQuery();
+    const { json: siteData } = await getSiteData();
+    return ctx.editMessageText('¿A qué categoría pertenece ahora?', {
+      reply_markup: categoryTagMenu(siteData, 'editcat'),
+    });
+  }
+
+  if (data.startsWith('editcat:g:') || data === 'editcat:none') {
+    await ctx.answerCbQuery();
+    const newCategoryKey = data === 'editcat:none' ? null : data.slice('editcat:g:'.length);
+    try {
+      const { json: siteData, sha } = await getSiteData();
+      const loc = findPhotoLocation(siteData, session.editPhotoId);
+      if (!loc) throw new Error('Ya no encuentro esa foto.');
+      if (newCategoryKey) loc.photo.categoryKey = newCategoryKey;
+      else delete loc.photo.categoryKey;
+      await commitSiteData(siteData, sha, `✏️ Editado: categoría de "${loc.photo.caption}"`);
+      await clearSession(chatId);
+      return ctx.editMessageText('✅ Categoría actualizada.');
+    } catch (err) {
+      console.error('Error editando categoría:', err);
+      return ctx.editMessageText('❌ No pude actualizarlo: ' + err.message);
+    }
+  }
+
+  if (data === 'edit:delete') {
+    await ctx.answerCbQuery();
+    return ctx.editMessageText('¿Seguro que querés borrar esta foto del sitio?', {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🗑 Sí, borrar', callback_data: 'edit:delete:yes' }],
+          [{ text: '✖️ No, cancelar', callback_data: 'cancel' }],
+        ],
+      },
+    });
+  }
+
+  if (data === 'edit:delete:yes') {
+    await ctx.answerCbQuery();
+    try {
+      const { json: siteData, sha } = await getSiteData();
+      const loc = findPhotoLocation(siteData, session.editPhotoId);
+      if (!loc) throw new Error('Ya no encuentro esa foto.');
+      const caption = loc.photo.caption;
+      let label = loc.containerName;
+      if (loc.targetType === 'country') {
+        const c = siteData.visited.find((x) => x.key === loc.targetKey);
+        c.photos = (c.photos || []).filter((p) => p.id !== session.editPhotoId);
+        // Si era la última foto de un país, vuelve a "sin fotos" — mismo
+        // criterio que /undo.
+        if (c.photos.length === 0) {
+          siteData.visited = siteData.visited.filter((x) => x.key !== loc.targetKey);
+          siteData.visitedEmpty.push({ key: c.key, name: c.name, lat: c.lat, lng: c.lng, w: c.w, h: c.h });
+          siteData.visitedEmpty.sort((a, b) => a.name.localeCompare(b.name, 'es'));
+        }
+      } else {
+        const cat = siteData.categories.find((x) => x.key === loc.targetKey);
+        cat.photos = (cat.photos || []).filter((p) => p.id !== session.editPhotoId);
+      }
+      await commitSiteData(siteData, sha, `🗑 Borrado: "${caption}" de ${label}`);
+      await clearSession(chatId);
+      return ctx.editMessageText(`🗑 Borrado — "${caption}" ya no está en ${label}.`);
+    } catch (err) {
+      console.error('Error borrando:', err);
+      return ctx.editMessageText('❌ No pude borrarlo: ' + err.message);
+    }
+  }
+
   // Terminó de mandar las fotos del álbum — arranca el flujo normal
   // (país/categoría/etc.) una sola vez para todo el lote junto.
   if (data === 'album:done') {
@@ -511,6 +690,25 @@ bot.on('text', async (ctx) => {
 
   if (session.step === 'await_caption_choice') {
     return ctx.reply('Tocá uno de los títulos de arriba, o "✏️ Escribir el mío" para escribir el tuyo.');
+  }
+
+  if (session.step === 'await_edit_select' || session.step === 'await_edit_action') {
+    return ctx.reply('Tocá uno de los botones de arriba (o /cancel).');
+  }
+
+  if (session.step === 'await_edit_caption') {
+    try {
+      const { json: siteData, sha } = await getSiteData();
+      const loc = findPhotoLocation(siteData, session.editPhotoId);
+      if (!loc) throw new Error('Ya no encuentro esa foto.');
+      loc.photo.caption = text;
+      await commitSiteData(siteData, sha, `✏️ Editado: título -> "${text}"`);
+      await clearSession(chatId);
+      return ctx.reply('✅ Título actualizado.');
+    } catch (err) {
+      console.error('Error editando título:', err);
+      return ctx.reply('❌ No pude actualizarlo: ' + err.message);
+    }
   }
 
   if (session.step === 'await_intro_choice') {
