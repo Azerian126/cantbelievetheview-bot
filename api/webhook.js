@@ -5,7 +5,7 @@ const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl, downloadBuffer, hashBuffer } = require('../lib/cloudinary');
 const { saveCleanUrl, findByHash, saveHash } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
-const { geocodePlace } = require('../lib/geocode');
+const { geocodePlaces } = require('../lib/geocode');
 
 // webhookReply:false — por default Telegraf manda la PRIMERA respuesta
 // saliente de cada update (acá, el editMessageText de la confirmación)
@@ -48,9 +48,26 @@ bot.start((ctx) =>
   )
 );
 
+// Cancela desde CUALQUIER paso del proceso, no solo desde las pantallas con
+// botones — antes /cancel no estaba registrado como comando, así que
+// Telegram lo mandaba como texto plano y el bot lo procesaba como
+// respuesta a lo que estuviera preguntando en ese momento (una vez terminó
+// buscando "cancel" como si fuera el nombre de un lugar).
+bot.command('cancel', async (ctx) => {
+  await clearSession(ctx.chat.id);
+  return ctx.reply('Cancelado. Mandame otra foto cuando quieras.', Markup.removeKeyboard());
+});
+
 // --- 1. llega una foto -------------------------------------------------------
 // Casi toda foto tiene país (es lo único que preguntamos de entrada). El caso
 // sin ubicación (ej. Modelos) es la excepción, no la alternativa por defecto.
+// Los nombres que devuelve Nominatim son largos ("Estambul, Fatih,
+// İstanbul, Marmara Bölgesi, 34122, Türkiye") — recortamos para que entren
+// bien en un botón de Telegram.
+function shortenPlace(name, max = 60) {
+  return name.length > max ? name.slice(0, max - 1) + '…' : name;
+}
+
 const askCountryText =
   '¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).';
 
@@ -150,6 +167,22 @@ bot.on('callback_query', async (ctx) => {
     return ctx.reply(askCountryText);
   }
 
+  // Eligió una de las opciones de lugar que encontró el geocoding.
+  if (data.startsWith('loc:')) {
+    const idx = parseInt(data.slice('loc:'.length), 10);
+    const place = session.pendingPlaces && session.pendingPlaces[idx];
+    await ctx.answerCbQuery();
+    if (!place) {
+      return ctx.editMessageText('Esa opción ya venció — escribí el lugar de nuevo.');
+    }
+    session.lat = place.lat;
+    session.lng = place.lng;
+    delete session.pendingPlaces;
+    await setSession(chatId, session);
+    await ctx.editMessageText(`Ubicación: ${place.displayName} ✅`);
+    return afterLocation(ctx, session);
+  }
+
   return ctx.answerCbQuery();
 });
 
@@ -224,20 +257,23 @@ bot.on('text', async (ctx) => {
     // No es el botón de GPS ni "Sin ubicación" — probamos buscarlo como
     // nombre de lugar (geocoding) antes de rendirnos. Cubre el caso de
     // subir una foto vieja de un viaje pasado, donde compartir el GPS
-    // actual no tiene sentido.
+    // actual no tiene sentido. Mostramos las opciones como botones en vez
+    // de aceptar la primera a ciegas — así elegís cuál es, en vez de
+    // confiar en que Nominatim adivinó bien (ver bug de "/cancel").
     try {
-      const place = await geocodePlace(text);
-      if (!place) {
+      const places = await geocodePlaces(text, 4);
+      if (!places.length) {
         return ctx.reply(
           `No encontré "${text}" como lugar. Probá con otro nombre (ej. "Estambul" en vez de "el puente ese"), ` +
             'tocá "📍 Compartir ubicación", o mandá "Sin ubicación" si no aplica.',
           locationKeyboard
         );
       }
-      session.lat = place.lat;
-      session.lng = place.lng;
-      await ctx.reply(`Ubicación: ${place.displayName} ✅`, Markup.removeKeyboard());
-      return afterLocation(ctx, session);
+      session.pendingPlaces = places;
+      await setSession(chatId, session);
+      const rows = places.map((p, i) => [{ text: shortenPlace(p.displayName), callback_data: `loc:${i}` }]);
+      rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
+      return ctx.reply(`¿Cuál de estos es "${text}"?`, { reply_markup: { inline_keyboard: rows } });
     } catch (err) {
       console.error('Error geocodificando:', err);
       return ctx.reply(
