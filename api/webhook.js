@@ -74,6 +74,8 @@ bot.start((ctx) =>
   ctx.reply(
     'Mandame una foto (o varias juntas) y te pregunto de qué país es (o "sin ubicación" si no aplica, ' +
       'ej. Modelos). En un rato queda publicada en cantbelievetheview.com.\n\n' +
+      '📎 Para que quede lista para imprimir en tamaños grandes, mandala como ARCHIVO (clip 📎 → "Archivo"/"File"), ' +
+      'no como foto normal — Telegram comprime toda foto normal a ~1280px sin avisar, sin importar el original.\n\n' +
       'En cualquier momento: /back para volver un paso atrás, /cancel para cortar todo.\n' +
       '/undo deshace la última subida. /editar corrige cualquier foto ya publicada. ' +
       '/recientes y /progreso muestran cómo va el sitio. /creditos muestra el saldo en xAI.'
@@ -522,26 +524,48 @@ bot.command('back', async (ctx) => {
   }
 });
 
-bot.on('photo', async (ctx) => {
-  const photos = ctx.message.photo;
-  const best = photos[photos.length - 1]; // la de mayor resolución
+// Tope real de la Bot API de Telegram para descargar un archivo por
+// getFile/getFileLink — arriba de esto, ni lo intentamos (tira un error
+// críptico de Telegram si lo intentamos igual).
+const TELEGRAM_MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
+
+const LOWRES_WARNING =
+  '⚠️ Esta foto llegó comprimida por Telegram — SIEMPRE reduce a ~1280px de lado largo, ' +
+  'sin importar la resolución del original. Sirve para vender copias chicas, pero en tamaños ' +
+  'grandes de impresión puede no alcanzar.\n\n' +
+  'Si tenés el archivo original, cancelá y reenviala como ARCHIVO en vez de foto: ' +
+  'clip 📎 → "Archivo" (o "File") → elegí la foto → mandar SIN que Telegram la comprima.';
+
+// Punto de entrada único para "ya tengo un file_id, ¿qué hago con él?" — lo
+// usan tanto bot.on('photo') (siempre llega comprimida) como el manejo de
+// documentos-imagen (llega tal cual el original). `compressed` decide si
+// más adelante, antes de pedir el país, se avisa del límite de resolución.
+async function handleIncomingFile(ctx, fileId, compressed) {
   const chatId = ctx.chat.id;
   const groupId = ctx.message.media_group_id || null;
 
   // Varias fotos mandadas juntas (álbum de Telegram) comparten media_group_id
   // y llegan como updates SEPARADOS, sin ningún evento de "fin de álbum" —
   // así que las vamos juntando en la sesión hasta que Mario toca "Listo".
+  // Un álbum puede mezclar fotos comprimidas y archivos sueltos — si
+  // CUALQUIERA de las dos llegó comprimida, se avisa al terminar de juntar.
   // (Nota: si dos fotos del mismo álbum llegan a webhooks casi simultáneos,
   // hay una ventana chica de condición de carrera al leer/escribir la
   // sesión — aceptable para un bot de un solo usuario, no se resuelve acá.)
   if (groupId) {
     const existingSession = await getSession(chatId);
     if (existingSession && existingSession.step === 'await_album_more' && existingSession.albumGroupId === groupId) {
-      existingSession.fileIds.push(best.file_id);
+      existingSession.fileIds.push(fileId);
+      if (compressed) existingSession.hasCompressedSource = true;
       await setSession(chatId, existingSession);
       return; // no respondemos de nuevo por cada foto — spamearía el chat
     }
-    await setSession(chatId, { step: 'await_album_more', albumGroupId: groupId, fileIds: [best.file_id] });
+    await setSession(chatId, {
+      step: 'await_album_more',
+      albumGroupId: groupId,
+      fileIds: [fileId],
+      hasCompressedSource: !!compressed,
+    });
     return ctx.reply(
       '📸 Detecté varias fotos juntas — te las voy juntando. Tocá "✅ Listo" cuando termines de mandarlas.',
       { reply_markup: { inline_keyboard: [[{ text: '✅ Listo, continuar', callback_data: 'album:done' }]] } }
@@ -555,11 +579,16 @@ bot.on('photo', async (ctx) => {
   // se simplifica dejándolo afuera por ahora.
   let hash = null;
   try {
-    const fileLink = await ctx.telegram.getFileLink(best.file_id);
+    const fileLink = await ctx.telegram.getFileLink(fileId);
     hash = hashBuffer(await downloadBuffer(fileLink.href));
     const existing = await findByHash(hash);
     if (existing) {
-      await setSession(chatId, { step: 'await_duplicate_confirm', fileIds: [best.file_id], hash });
+      await setSession(chatId, {
+        step: 'await_duplicate_confirm',
+        fileIds: [fileId],
+        hash,
+        hasCompressedSource: !!compressed,
+      });
       return ctx.reply(
         `⚠️ Esta foto ya está subida — en ${existing.label}.\n¿La subís igual (ej. para otro país o categoría) o cancelamos?`,
         {
@@ -576,8 +605,63 @@ bot.on('photo', async (ctx) => {
     console.error('Error chequeando duplicado:', err);
   }
 
-  await setSession(chatId, { step: 'await_country', fileIds: [best.file_id], hash });
+  const session = { step: 'await_country', fileIds: [fileId], hash, hasCompressedSource: !!compressed };
+  if (compressed) return askLowresConfirm(ctx, session);
+  await setSession(chatId, session);
   await ctx.reply(askCountryText);
+}
+
+// Se muestra antes de pedir el país cuando la(s) foto(s) en la sesión
+// llegaron comprimidas — nunca en silencio, para que no vuelva a pasar lo
+// de las 4 fotos publicadas a 960x1280 sin que nadie lo notara.
+async function askLowresConfirm(ctx, session) {
+  const chatId = ctx.chat.id;
+  session.step = 'await_lowres_confirm';
+  await setSession(chatId, session);
+  return ctx.reply(LOWRES_WARNING, {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✅ Subir igual, comprimida', callback_data: 'lowres:continue' }],
+        [{ text: '✖️ Cancelar, la reenvío como archivo', callback_data: 'lowres:cancel' }],
+      ],
+    },
+  });
+}
+
+// Punto de entrada común una vez que terminó de juntar las fotos de un
+// álbum (con o sin pasar antes por el aviso de baja resolución) — decide
+// si hace falta preguntar "¿mismo país o varios?" o si con una sola foto
+// alcanza con ir directo a país.
+async function proceedAfterAlbumCollected(ctx, session) {
+  const chatId = ctx.chat.id;
+  if (session.fileIds.length === 1) {
+    session.step = 'await_country';
+    await setSession(chatId, session);
+    await ctx.reply('📸 1 foto ✅');
+    return ctx.reply(askCountryText);
+  }
+  // Con más de una foto, hay que saber si van todas al mismo país o no
+  // antes de preguntar nada más — si no, asumíamos "mismo país" siempre,
+  // y un álbum de varios lugares distintos quedaba mal etiquetado.
+  session.step = 'await_album_scope';
+  await setSession(chatId, session);
+  return ctx.reply(
+    `📸 ${session.fileIds.length} fotos juntadas ✅\n¿Son todas del mismo país, o hay de varios países distintos?`,
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🌍 Mismo país para todas', callback_data: 'album:same' }],
+          [{ text: '🌎 Son de varios países', callback_data: 'album:multi' }],
+        ],
+      },
+    }
+  );
+}
+
+bot.on('photo', async (ctx) => {
+  const photos = ctx.message.photo;
+  const best = photos[photos.length - 1]; // la de mayor resolución (igual, nunca es el original)
+  await handleIncomingFile(ctx, best.file_id, true);
 });
 
 // --- 2. botones ---------------------------------------------------------------
@@ -698,31 +782,15 @@ bot.on('callback_query', async (ctx) => {
   }
 
   // Terminó de mandar las fotos del álbum — arranca el flujo normal
-  // (país/categoría/etc.) una sola vez para todo el lote junto.
+  // (país/categoría/etc.) una sola vez para todo el lote junto. Si alguna
+  // llegó comprimida, se avisa ACÁ, antes de seguir — no en silencio.
   if (data === 'album:done') {
     await ctx.answerCbQuery();
-    if (session.fileIds.length === 1) {
-      session.step = 'await_country';
-      await setSession(chatId, session);
-      await ctx.editMessageText('📸 1 foto ✅');
-      return ctx.reply(askCountryText);
+    if (session.hasCompressedSource) {
+      await ctx.editMessageText(`📸 ${session.fileIds.length === 1 ? '1 foto' : session.fileIds.length + ' fotos'} juntadas.`);
+      return askLowresConfirm(ctx, session);
     }
-    // Con más de una foto, hay que saber si van todas al mismo país o no
-    // antes de preguntar nada más — si no, asumíamos "mismo país" siempre,
-    // y un álbum de varios lugares distintos quedaba mal etiquetado.
-    session.step = 'await_album_scope';
-    await setSession(chatId, session);
-    return ctx.editMessageText(
-      `📸 ${session.fileIds.length} fotos juntadas ✅\n¿Son todas del mismo país, o hay de varios países distintos?`,
-      {
-        reply_markup: {
-          inline_keyboard: [
-            [{ text: '🌍 Mismo país para todas', callback_data: 'album:same' }],
-            [{ text: '🌎 Son de varios países', callback_data: 'album:multi' }],
-          ],
-        },
-      }
-    );
+    return proceedAfterAlbumCollected(ctx, session);
   }
 
   if (data === 'album:same') {
@@ -731,6 +799,28 @@ bot.on('callback_query', async (ctx) => {
     await setSession(chatId, session);
     await ctx.editMessageText(`Dale, un solo país para las ${session.fileIds.length} fotos.`);
     return ctx.reply(askCountryText);
+  }
+
+  // Aceptó subir igual, en baja resolución — retoma justo donde el aviso
+  // interrumpió: una foto sola va directo a país, un álbum vuelve a
+  // preguntar (mismo país / varios países).
+  if (data === 'lowres:continue') {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('Dale, sigo con la comprimida.');
+    if (session.fileIds.length === 1 && !session.albumGroupId) {
+      session.step = 'await_country';
+      await setSession(chatId, session);
+      return ctx.reply(askCountryText);
+    }
+    return proceedAfterAlbumCollected(ctx, session);
+  }
+
+  if (data === 'lowres:cancel') {
+    await clearSession(chatId);
+    await ctx.answerCbQuery('Cancelado');
+    return ctx.editMessageText(
+      'Cancelado. Reenviala como archivo: clip 📎 → "Archivo" (o "File") → elegí la foto → mandar SIN comprimir.'
+    );
   }
 
   // Son de países distintos — en vez de un target único para el lote, las
@@ -784,9 +874,10 @@ bot.on('callback_query', async (ctx) => {
   // toma sirve para dos países fronterizos, o la quiere en otra categoría).
   if (data === 'dup:continue') {
     await ctx.answerCbQuery();
+    await ctx.editMessageText('Dale, seguimos.');
+    if (session.hasCompressedSource) return askLowresConfirm(ctx, session);
     session.step = 'await_country';
     await setSession(chatId, session);
-    await ctx.editMessageText('Dale, seguimos.');
     return ctx.reply(askCountryText);
   }
 
@@ -1032,20 +1123,38 @@ bot.on('location', async (ctx) => {
   });
 });
 
-// Si mandás una foto "como archivo" (sin comprimir — lo que conviene para
-// imprimir, porque bot.on('photo') siempre recibe la versión comprimida de
-// Telegram, nunca el original), o un video, sticker, audio, etc., antes no
-// pasaba NADA — el bot se quedaba mudo y parecía roto. Avisamos qué mandar
-// en cambio. (Soportar el archivo sin comprimir de verdad es más laburo —
-// queda en la lista de pendientes, no es un fix de una línea.)
-bot.on(['document', 'video', 'video_note', 'animation', 'sticker', 'voice', 'audio'], async (ctx) => {
-  const isImageDoc = ctx.message.document && /^image\//.test(ctx.message.document.mime_type || '');
-  if (isImageDoc) {
+// Foto mandada "como archivo" (clip 📎 → Archivo/File) — ESTE es el único
+// camino por el que Telegram entrega el original tal cual, sin comprimir a
+// ~1280px como hace bot.on('photo'). Antes esto se rechazaba explícitamente;
+// ahora es el camino recomendado para todo lo que se vaya a imprimir grande.
+bot.on('document', async (ctx) => {
+  const doc = ctx.message.document;
+  const isImage = /^image\//.test(doc.mime_type || '');
+  if (!isImage) {
+    return ctx.reply('Por ahora solo puedo procesar fotos (y su ubicación/texto de respuesta) — mandame una foto para empezar.');
+  }
+
+  // Chequeo del tamaño ANTES de intentar descargar — si se le pega directo
+  // a getFileLink/getFile con un archivo de más de 20MB, Telegram tira un
+  // error críptico ("file is too big") en vez de esto. file_size viene casi
+  // siempre en el documento; si faltara (raro), seguimos igual y, en el peor
+  // caso, falla más adelante con un error genérico al subir — no bloqueamos
+  // por una ausencia de dato que casi nunca pasa.
+  if (doc.file_size && doc.file_size > TELEGRAM_MAX_DOWNLOAD_BYTES) {
+    const mb = (doc.file_size / (1024 * 1024)).toFixed(1);
     return ctx.reply(
-      '📎 Recibí la foto como archivo (sin comprimir) — todavía no puedo procesarla así. ' +
-        'Mandala como foto normal de Telegram (sin el clip 📎), comprimida está bien.'
+      `📎 Este archivo pesa ${mb}MB — Telegram no me deja descargar más de 20MB a través del bot ` +
+        '(es un límite de la Bot API de Telegram, no mío). Si es un RAW de cámara (.CR3, .NEF, etc.), ' +
+        'exportalo primero a JPEG de buena calidad (queda bien debajo de 20MB) y reenvialo así — ' +
+        'alcanza de sobra para imprimir en cualquier tamaño del catálogo.'
     );
   }
+
+  await handleIncomingFile(ctx, doc.file_id, false);
+});
+
+// Video, sticker, audio, etc. — no hay nada que hacer con esto todavía.
+bot.on(['video', 'video_note', 'animation', 'sticker', 'voice', 'audio'], async (ctx) => {
   return ctx.reply('Por ahora solo puedo procesar fotos (y su ubicación/texto de respuesta) — mandame una foto para empezar.');
 });
 
@@ -1156,7 +1265,7 @@ async function finalize(ctx, session) {
     for (let i = 0; i < fileIds.length; i++) {
       const fileLink = await ctx.telegram.getFileLink(fileIds[i]);
       const publicIdHint = fileIds.length > 1 ? `${session.target.key}-${Date.now()}-${i}` : `${session.target.key}-${Date.now()}`;
-      const { cleanUrl, displayUrl, hash, buffer } = await uploadFromUrl(fileLink.href, publicIdHint);
+      const { cleanUrl, displayUrl, hash, buffer, width, height } = await uploadFromUrl(fileLink.href, publicIdHint);
       const photoId = publicIdHint;
 
       // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
@@ -1181,6 +1290,14 @@ async function finalize(ctx, session) {
       }
 
       const photoEntry = { id: photoId, displayUrl, caption: session.captions[i] };
+      // Dimensiones reales del archivo subido (px) — de acá el sitio calcula
+      // qué tamaños de impresión puede ofrecer para esta foto sin quedar
+      // blanda (ver dpiParaTamaño en sitio/index.html). No son sensibles —
+      // van directo a data.json, que ya es público.
+      if (width && height) {
+        photoEntry.w = width;
+        photoEntry.h = height;
+      }
       // Traducción al inglés del título — sin esto, el sitio en inglés
       // mostraba el título en español tal cual (nunca había campo para el
       // inglés). Si falla la traducción no bloqueamos la subida — el sitio
