@@ -2,8 +2,8 @@ const { Telegraf, Markup } = require('telegraf');
 const { getSession, setSession, clearSession } = require('../lib/session');
 const { categoryMenu, categoryTagMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
-const { uploadFromUrl } = require('../lib/cloudinary');
-const { saveCleanUrl } = require('../lib/photoStore');
+const { uploadFromUrl, downloadBuffer, hashBuffer } = require('../lib/cloudinary');
+const { saveCleanUrl, findByHash, saveHash } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlace } = require('../lib/geocode');
 
@@ -51,11 +51,42 @@ bot.start((ctx) =>
 // --- 1. llega una foto -------------------------------------------------------
 // Casi toda foto tiene país (es lo único que preguntamos de entrada). El caso
 // sin ubicación (ej. Modelos) es la excepción, no la alternativa por defecto.
+const askCountryText =
+  '¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).';
+
 bot.on('photo', async (ctx) => {
   const photos = ctx.message.photo;
   const best = photos[photos.length - 1]; // la de mayor resolución
-  await setSession(ctx.chat.id, { step: 'await_country', fileId: best.file_id });
-  await ctx.reply('¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).');
+  const chatId = ctx.chat.id;
+
+  // Detección de duplicados: mismo archivo (hash) ya subido antes, sin
+  // importar cuándo ni a qué país/categoría. Si falla el chequeo (ej. la
+  // API de Telegram no responde) seguimos igual — no bloqueamos por esto.
+  let hash = null;
+  try {
+    const fileLink = await ctx.telegram.getFileLink(best.file_id);
+    hash = hashBuffer(await downloadBuffer(fileLink.href));
+    const existing = await findByHash(hash);
+    if (existing) {
+      await setSession(chatId, { step: 'await_duplicate_confirm', fileId: best.file_id, hash });
+      return ctx.reply(
+        `⚠️ Esta foto ya está subida — en ${existing.label}.\n¿La subís igual (ej. para otro país o categoría) o cancelamos?`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '✅ Subir igual', callback_data: 'dup:continue' }],
+              [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
+            ],
+          },
+        }
+      );
+    }
+  } catch (err) {
+    console.error('Error chequeando duplicado:', err);
+  }
+
+  await setSession(chatId, { step: 'await_country', fileId: best.file_id, hash });
+  await ctx.reply(askCountryText);
 });
 
 // --- 2. botones ---------------------------------------------------------------
@@ -109,6 +140,16 @@ bot.on('callback_query', async (ctx) => {
     return finalize(ctx, session);
   }
 
+  // Confirmó que quiere subir la foto igual aunque ya exista (ej. la misma
+  // toma sirve para dos países fronterizos, o la quiere en otra categoría).
+  if (data === 'dup:continue') {
+    await ctx.answerCbQuery();
+    session.step = 'await_country';
+    await setSession(chatId, session);
+    await ctx.editMessageText('Dale, seguimos.');
+    return ctx.reply(askCountryText);
+  }
+
   return ctx.answerCbQuery();
 });
 
@@ -119,6 +160,10 @@ bot.on('text', async (ctx) => {
   if (!session || !session.step) return; // no está en medio de un flujo
 
   const text = ctx.message.text.trim();
+
+  if (session.step === 'await_duplicate_confirm') {
+    return ctx.reply('Tocá uno de los botones de arriba (✅ Subir igual / ✖️ Cancelar) para seguir.');
+  }
 
   if (session.step === 'await_country') {
     const { json: siteData } = await getSiteData();
@@ -276,7 +321,7 @@ async function finalize(ctx, session) {
 
     const fileLink = await ctx.telegram.getFileLink(session.fileId);
     const publicIdHint = `${session.target.key}-${Date.now()}`;
-    const { cleanUrl, displayUrl } = await uploadFromUrl(fileLink.href, publicIdHint);
+    const { cleanUrl, displayUrl, hash } = await uploadFromUrl(fileLink.href, publicIdHint);
     const photoId = publicIdHint;
 
     // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
@@ -341,6 +386,10 @@ async function finalize(ctx, session) {
 
     const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${session.caption} — ${fullLabel}`;
     await commitSiteData(siteData, sha, message);
+
+    // Registrar el hash del archivo — así, si esta misma foto se vuelve a
+    // mandar más adelante, el bot avisa antes de subirla de nuevo.
+    await saveHash(hash, photoId, fullLabel);
 
     await clearSession(chatId);
     await ctx.reply(
