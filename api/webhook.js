@@ -62,6 +62,18 @@ const locationKeyboard = Markup.keyboard([
   ['Sin ubicación'],
 ]).resize().oneTime();
 
+// --- que nunca vuelva a fallar en silencio ---------------------------------
+// Hasta ahora, un error a mitad de un paso subía hasta el handler de Vercel,
+// se escribía en la consola y ahí moría: en el chat no pasaba nada. Así estuvo
+// roto el pedido de título sin que se notara. Ahora cualquier error suelto se
+// avisa en el chat, aunque sea feo — mejor un mensaje feo que un paso mudo.
+bot.catch((err, ctx) => {
+  console.error('Error no atrapado procesando update:', err);
+  if (ctx && ctx.chat) {
+    return ctx.reply('❌ Se me cayó un paso: ' + err.message + '\nMandá /cancel y empezá de nuevo si quedó trabado.').catch(() => {});
+  }
+});
+
 // --- seguridad: solo Mario puede usar este bot -----------------------------
 bot.use(async (ctx, next) => {
   const fromId = String(ctx.from && ctx.from.id);
@@ -301,6 +313,22 @@ const locationPrompt =
   '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación, escribí el nombre del lugar ' +
   '(ej. "Estambul" o "Torres Petronas") si no estás ahí parado, o mandá "Sin ubicación" si no la tenés.';
 
+// Reenviar una foto por file_id solo funciona si ese file_id es de tipo photo.
+// Desde que las fotos entran como ARCHIVO (ver bot.on('document')), el file_id
+// es de documento y sendPhoto lo rechaza. El error se tragaba más arriba y la
+// pregunta nunca llegaba al chat: como la sesión ya había quedado en el paso
+// correcto, escribir el título igual funcionaba — pero sin que el bot lo pidiera.
+// Ante cualquier fallo al reenviar, la pregunta se manda igual como texto: es
+// preferible perder la miniatura antes que perder la pregunta.
+async function replyWithPhotoOrText(ctx, fileId, caption, extra = {}) {
+  try {
+    return await ctx.replyWithPhoto(fileId, { caption, ...extra });
+  } catch (err) {
+    console.error('No pude reenviar la foto (file_id de documento?):', err.message);
+    return ctx.reply(caption, extra);
+  }
+}
+
 // El título SIEMPRE lo escribe Mario a mano — sin sugerencias de IA, sin
 // menú. La IA solo se encarga de la descripción corta (ver askDescription).
 // Con álbum, se pide un título POR FOTO (no uno solo para todo el lote) —
@@ -310,12 +338,14 @@ const locationPrompt =
 async function askTitle(ctx, session) {
   const chatId = ctx.chat.id;
   const idx = session.captionIndex || 0;
-  const fileId = session.fileIds[idx];
   const total = session.fileIds.length;
-  const label = total > 1 ? `📸 Foto ${idx + 1} de ${total}\n` : '';
   session.step = 'await_title';
   await setSession(chatId, session);
-  return ctx.replyWithPhoto(fileId, { caption: `${label}¿Qué título le ponés a esta foto?` });
+  const question = '¿Qué título le ponés a esta foto?';
+  // Con una sola foto no hace falta reenviarla: no hay ambigüedad posible, y
+  // reenviarla era justamente lo que rompía la pregunta (ver replyWithPhotoOrText).
+  if (total === 1) return ctx.reply(question);
+  return replyWithPhotoOrText(ctx, session.fileIds[idx], `📸 Foto ${idx + 1} de ${total}\n${question}`);
 }
 
 // Guarda el título tipeado y pasa a pedirle a la IA la descripción corta.
@@ -398,7 +428,7 @@ async function askLocation(ctx, session) {
   await setSession(chatId, session);
   if (total > 1) {
     const label = `📍 Foto ${idx + 1} de ${total}\n`;
-    return ctx.replyWithPhoto(fileId, { caption: `${label}${locationPrompt}`, ...locationKeyboard });
+    return replyWithPhotoOrText(ctx, fileId, `${label}${locationPrompt}`, locationKeyboard);
   }
   return ctx.reply(locationPrompt, locationKeyboard);
 }
