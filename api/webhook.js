@@ -1,6 +1,6 @@
 const { Telegraf, Markup } = require('telegraf');
 const { getSession, setSession, clearSession } = require('../lib/session');
-const { categoryMenu, categoryTagMenu } = require('../lib/keyboards');
+const { categoryMenu, categoryTagMenu, categoryMultiMenu } = require('../lib/keyboards');
 const { getSiteData, commitSiteData } = require('../lib/github');
 const { uploadFromUrl, uploadPrintDerivatives, downloadBuffer, hashBuffer } = require('../lib/cloudinary');
 const {
@@ -15,7 +15,8 @@ const {
   resetAllPhotoKeys,
 } = require('../lib/photoStore');
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
-const { geocodePlaces } = require('../lib/geocode');
+const { geocodePlaces, reverseGeocode } = require('../lib/geocode');
+const { gpsFromBuffer } = require('../lib/photoExif');
 const { suggestDescriptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
 const { getRemainingCredits } = require('../lib/xaiBilling');
 
@@ -58,7 +59,7 @@ const NO_COUNTRY_WORDS = ['sin ubicacion', 'ninguno', 'ninguna', 'no', 'n/a', 'n
 // coordenada que queda en data.json es la real (la del GPS de tu teléfono al
 // sacar la foto, o la que elijas a mano en el mapa), no una inventada.
 const locationKeyboard = Markup.keyboard([
-  [Markup.button.locationRequest('📍 Compartir ubicación')],
+  [Markup.button.locationRequest('📍 Estoy acá ahora mismo')],
   ['Sin ubicación'],
 ]).resize().oneTime();
 
@@ -113,17 +114,162 @@ function timestampFromPhotoId(id) {
   return m ? parseInt(m[1], 10) : 0;
 }
 
+// Todas las fotos del sitio, de la más nueva a la más vieja, cada una con el
+// país o categoría donde vive. Lo usan /recientes y /editar — antes cada uno
+// armaba su propia lista con el mismo código repetido.
+function collectAllPhotos(siteData) {
+  const all = [];
+  siteData.visited.forEach((c) =>
+    (c.photos || []).forEach((p) => all.push({ ...p, place: c.name, placeKey: c.key, placeKind: 'country' }))
+  );
+  siteData.categories.forEach((cat) =>
+    (cat.photos || []).forEach((p) => all.push({ ...p, place: cat.name, placeKey: cat.key, placeKind: 'category' }))
+  );
+  return all.sort((a, b) => timestampFromPhotoId(b.id) - timestampFromPhotoId(a.id));
+}
+
+// Cuántas fotos entran en una pantalla de /editar. Ocho deja lugar para la
+// fila de navegación y los atajos sin que el teclado tape el chat.
+const EDIT_PAGE_SIZE = 8;
+
+// El "alcance" es qué subconjunto de fotos se está mirando: las últimas, las
+// de un país, o el resultado de una búsqueda. Vive en la sesión y no en el
+// callback_data — así los botones quedan chicos (Telegram corta a 64 bytes) y
+// el número de página es lo único que viaja.
+function photosForScope(siteData, scope) {
+  const all = collectAllPhotos(siteData);
+  if (!scope || scope.kind === 'recent') return all;
+  if (scope.kind === 'place') return all.filter((p) => p.placeKey === scope.key);
+  if (scope.kind === 'query') {
+    const q = normalize(scope.q);
+    return all.filter((p) =>
+      [p.caption, p.captionEn, p.place].some((f) => f && normalize(f).includes(q))
+    );
+  }
+  return all;
+}
+
+function scopeLabel(scope) {
+  if (!scope || scope.kind === 'recent') return 'Últimas subidas';
+  if (scope.kind === 'place') return scope.name;
+  return `Búsqueda: "${scope.q}"`;
+}
+
+// Dibuja una página del listado. `useEdit` reescribe el mensaje actual en vez
+// de mandar uno nuevo — así navegar entre páginas no llena el chat.
+async function sendEditPage(ctx, session, page, useEdit) {
+  const chatId = ctx.chat.id;
+  const { json: siteData } = await getSiteData();
+  const list = photosForScope(siteData, session.editScope);
+
+  if (!list.length) {
+    const msg =
+      session.editScope && session.editScope.kind === 'query'
+        ? `No encontré ninguna foto que diga "${session.editScope.q}". Probá con otra palabra, o /editar para ver el menú.`
+        : 'Todavía no hay ninguna foto subida.';
+    return useEdit ? ctx.editMessageText(msg) : ctx.reply(msg);
+  }
+
+  const pages = Math.ceil(list.length / EDIT_PAGE_SIZE);
+  const current = Math.min(Math.max(page, 0), pages - 1);
+  const slice = list.slice(current * EDIT_PAGE_SIZE, (current + 1) * EDIT_PAGE_SIZE);
+
+  session.step = 'await_edit_select';
+  session.editPage = current;
+  await setSession(chatId, session);
+
+  const rows = slice.map((p) => [
+    { text: shortenPlace(`${p.caption} — ${p.place}`, 60), callback_data: `edit:sel:${p.id}` },
+  ]);
+
+  // Fila de navegación solo si hay más de una página — con pocas fotos no
+  // tiene sentido ocupar espacio con flechas que no llevan a ningún lado.
+  if (pages > 1) {
+    const nav = [];
+    if (current > 0) nav.push({ text: '◀️', callback_data: `ed:p:${current - 1}` });
+    nav.push({ text: `${current + 1}/${pages}`, callback_data: 'noop' });
+    if (current < pages - 1) nav.push({ text: '▶️', callback_data: `ed:p:${current + 1}` });
+    rows.push(nav);
+  }
+  rows.push([
+    { text: '🌍 Por país', callback_data: 'ed:places:0' },
+    { text: '↩️ Menú', callback_data: 'ed:menu' },
+  ]);
+  rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
+
+  const header = `${scopeLabel(session.editScope)} — ${list.length} foto${list.length === 1 ? '' : 's'}\n¿Cuál querés editar?`;
+  const markup = { reply_markup: { inline_keyboard: rows } };
+  return useEdit ? ctx.editMessageText(header, markup) : ctx.reply(header, markup);
+}
+
+// Lista de países/categorías que tienen fotos, con cuántas — el punto de
+// entrada cuando no te acordás del título pero sí de dónde era.
+async function sendPlacesPage(ctx, session, page, useEdit) {
+  const chatId = ctx.chat.id;
+  const { json: siteData } = await getSiteData();
+  const all = collectAllPhotos(siteData);
+  const byKey = new Map();
+  all.forEach((p) => {
+    const e = byKey.get(p.placeKey) || { key: p.placeKey, name: p.place, n: 0 };
+    e.n++;
+    byKey.set(p.placeKey, e);
+  });
+  const places = [...byKey.values()].sort((a, b) => a.name.localeCompare(b.name, 'es'));
+
+  if (!places.length) {
+    const msg = 'Todavía no hay ninguna foto subida.';
+    return useEdit ? ctx.editMessageText(msg) : ctx.reply(msg);
+  }
+
+  const pages = Math.ceil(places.length / EDIT_PAGE_SIZE);
+  const current = Math.min(Math.max(page, 0), pages - 1);
+  const slice = places.slice(current * EDIT_PAGE_SIZE, (current + 1) * EDIT_PAGE_SIZE);
+
+  session.step = 'await_edit_select';
+  await setSession(chatId, session);
+
+  const rows = slice.map((pl) => [{ text: `${pl.name} (${pl.n})`, callback_data: `ed:pl:${pl.key}` }]);
+  if (pages > 1) {
+    const nav = [];
+    if (current > 0) nav.push({ text: '◀️', callback_data: `ed:places:${current - 1}` });
+    nav.push({ text: `${current + 1}/${pages}`, callback_data: 'noop' });
+    if (current < pages - 1) nav.push({ text: '▶️', callback_data: `ed:places:${current + 1}` });
+    rows.push(nav);
+  }
+  rows.push([{ text: '↩️ Menú', callback_data: 'ed:menu' }]);
+  rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
+
+  const header = '¿De qué país o categoría?';
+  const markup = { reply_markup: { inline_keyboard: rows } };
+  return useEdit ? ctx.editMessageText(header, markup) : ctx.reply(header, markup);
+}
+
+async function sendEditMenu(ctx, session, useEdit) {
+  await setSession(ctx.chat.id, { ...session, step: 'await_edit_select' });
+  const text =
+    '¿Qué foto querés editar?\n\nBuscá por título escribiendo `/editar <palabra>` — ej. `/editar lluvia`.';
+  const markup = {
+    parse_mode: 'Markdown',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🕐 Últimas subidas', callback_data: 'ed:recent' }],
+        [{ text: '🌍 Por país o categoría', callback_data: 'ed:places:0' }],
+        [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
+      ],
+    },
+  };
+  return useEdit ? ctx.editMessageText(text, markup) : ctx.reply(text, markup);
+}
+
 bot.command('recientes', async (ctx) => {
   const { json: siteData } = await getSiteData();
-  const all = [];
-  siteData.visited.forEach((c) => (c.photos || []).forEach((p) => all.push({ ...p, place: c.name })));
-  siteData.categories.forEach((cat) => (cat.photos || []).forEach((p) => all.push({ ...p, place: cat.name })));
-  all.sort((a, b) => timestampFromPhotoId(b.id) - timestampFromPhotoId(a.id));
+  const all = collectAllPhotos(siteData);
 
   if (!all.length) return ctx.reply('Todavía no hay ninguna foto subida.');
 
   const lines = all.slice(0, 8).map((p) => `• "${p.caption}" — ${p.place}`);
-  return ctx.reply(`Últimas ${lines.length} fotos:\n\n` + lines.join('\n'));
+  const resto = all.length > 8 ? `\n\n(hay ${all.length} en total — /editar las lista todas)` : '';
+  return ctx.reply(`Últimas ${lines.length} fotos:\n\n` + lines.join('\n') + resto);
 });
 
 bot.command('progreso', async (ctx) => {
@@ -138,11 +284,19 @@ bot.command('progreso', async (ctx) => {
   const catLines = siteData.categories.map((cat) => {
     const own = (cat.photos || []).length;
     const tagged = siteData.visited.reduce(
-      (n, c) => n + (c.photos || []).filter((p) => p.categoryKey === cat.key).length,
+      (n, c) => n + (c.photos || []).filter((p) => photoCategoryKeys(p).includes(cat.key)).length,
       0
     );
     return `  • ${cat.name}: ${own + tagged}`;
   });
+
+  // Una foto en tres categorías suma en las tres, así que la columna de
+  // categorías puede pasarse del total de fotos. Es correcto, pero visto de
+  // golpe dentro de dos meses parece un error de conteo — se dice acá mismo.
+  const multi = siteData.visited.reduce(
+    (n, c) => n + (c.photos || []).filter((p) => photoCategoryKeys(p).length > 1).length,
+    0
+  );
 
   const lines = [
     `🌍 Países con fotos: ${withPhotos.length} / ${siteData.visited.length + siteData.visitedEmpty.length}`,
@@ -151,6 +305,13 @@ bot.command('progreso', async (ctx) => {
     'Por categoría:',
     ...catLines,
   ];
+  if (multi > 0) {
+    lines.push(
+      '',
+      `ℹ️ ${multi} ${multi === 1 ? 'foto está' : 'fotos están'} en más de una categoría, ` +
+        'así que estos números suman más que el total de fotos.'
+    );
+  }
   return ctx.reply(lines.join('\n'));
 });
 
@@ -183,32 +344,84 @@ function findPhotoLocation(siteData, photoId) {
   return null;
 }
 
+// Escribe las categorías de una foto ya publicada y commitea. Es el ÚNICO
+// camino de escritura desde /editar — el de una sola categoría y el de varias
+// terminan los dos acá, así que no hay forma de que una rama deje la foto a
+// medias con el campo viejo huérfano (ver setPhotoCategories).
+async function commitPhotoCategories(ctx, chatId, session, keys) {
+  try {
+    const { json: siteData, sha } = await getSiteData();
+    const loc = findPhotoLocation(siteData, session.editPhotoId);
+    if (!loc) throw new Error('Ya no encuentro esa foto.');
+    setPhotoCategories(loc.photo, keys);
+    const names = categoryNames(siteData, keys);
+    await commitSiteData(siteData, sha, `✏️ Editado: categorías de "${loc.photo.caption}"`);
+    await clearSession(chatId);
+    return ctx.editMessageText(names ? `✅ Categorías: ${names}.` : '✅ Sin categoría temática.');
+  } catch (err) {
+    console.error('Error editando categoría:', err);
+    return ctx.editMessageText('❌ No pude actualizarlo: ' + err.message);
+  }
+}
+
 // /editar — a diferencia de /undo (solo la última subida), esto deja
 // corregir cualquier foto ya publicada: cambiarle el título, la categoría
 // temática, o borrarla. Arranca mostrando las últimas 10 para elegir.
+// /editar [texto] — con texto busca por título o lugar; sin texto abre el
+// menú. Antes mostraba las últimas 10 y nada más: pasadas esas, una foto era
+// inalcanzable salvo borrándola. Ahora todo el catálogo es navegable, por
+// búsqueda, por país o paginando.
 bot.command('editar', async (ctx) => {
-  const { json: siteData } = await getSiteData();
-  const all = [];
-  siteData.visited.forEach((c) => (c.photos || []).forEach((p) => all.push({ ...p, place: c.name })));
-  siteData.categories.forEach((cat) => (cat.photos || []).forEach((p) => all.push({ ...p, place: cat.name })));
-  all.sort((a, b) => timestampFromPhotoId(b.id) - timestampFromPhotoId(a.id));
+  const query = (ctx.message.text || '').replace(/^\/editar(@\S+)?\s*/i, '').trim();
+  const session = { step: 'await_edit_select' };
 
-  if (!all.length) return ctx.reply('Todavía no hay ninguna foto subida.');
-
-  const recent = all.slice(0, 10);
-  const rows = recent.map((p) => [
-    { text: shortenPlace(`${p.caption} — ${p.place}`, 60), callback_data: `edit:sel:${p.id}` },
-  ]);
-  rows.push([{ text: '✖️ Cancelar', callback_data: 'cancel' }]);
-  await setSession(ctx.chat.id, { step: 'await_edit_select' });
-  return ctx.reply('¿Cuál foto querés editar?', { reply_markup: { inline_keyboard: rows } });
+  if (query) {
+    session.editScope = { kind: 'query', q: query };
+    return sendEditPage(ctx, session, 0, false);
+  }
+  return sendEditMenu(ctx, session, false);
 });
 
 // Deshace la última subida (por chat) — saca la(s) foto(s) de data.json, si
 // era un país nuevo lo devuelve a "sin fotos", borra el registro de
 // duplicados de esos archivos, y listo. Solo funciona sobre lo último que
 // se subió (24hs de margen) — no es un historial completo de cambios.
+// /undo NO deshace la última edición: deshace la última SUBIDA, o sea que
+// borra fotos del sitio publicado. Mario lo usó creyendo que revertía un
+// cambio de categoría y perdió una foto entera. Ahora dice exactamente qué se
+// va a llevar y pide confirmación antes de tocar nada.
 bot.command('undo', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const last = await getLastUpload(chatId);
+  if (!last) {
+    return ctx.reply(
+      'No tengo ninguna subida reciente para deshacer (o ya pasaron más de 24hs).\n\n' +
+        '(Ojo: /undo deshace la última SUBIDA. Para corregir el título, la categoría o la ubicación de ' +
+        'una foto ya publicada, usá /editar.)'
+    );
+  }
+
+  const cuantas = (last.photoIds || []).length;
+  const cuales = (last.captions || []).map((c) => `• "${c}"`).join('\n');
+  // A propósito NO se toca la sesión: si Mario está a mitad de una subida y
+  // tipea /undo, no queremos borrarle el progreso. El botón de confirmar se
+  // resuelve antes del chequeo de sesión.
+  return ctx.reply(
+    `⚠️ /undo deshace la última SUBIDA — no la última edición.\n\n` +
+      `Voy a BORRAR del sitio ${cuantas === 1 ? 'esta foto' : `estas ${cuantas} fotos`}:\n${cuales || '(sin título)'}\n\n` +
+      'Si lo que querías era corregir el título, la categoría o la ubicación, cancelá y usá /editar.',
+    {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🗑 Sí, borrarla del sitio', callback_data: 'undo:yes' }],
+          [{ text: '✖️ No, cancelar', callback_data: 'cancel' }],
+        ],
+      },
+    }
+  );
+});
+
+async function performUndo(ctx) {
   const chatId = ctx.chat.id;
   const last = await getLastUpload(chatId);
   if (!last) {
@@ -264,7 +477,7 @@ bot.command('undo', async (ctx) => {
     console.error('Error deshaciendo:', err);
     return ctx.reply('❌ No pude deshacerlo: ' + err.message);
   }
-});
+}
 
 // Reset de emergencia — borra en Redis todo lo que quedó de fotos ya
 // eliminadas de data.json y de Cloudinary a mano (URLs limpias, derivadas
@@ -302,6 +515,125 @@ function shortenPlace(name, max = 60) {
 // para no tener que ir a mirar la consola de xAI cada vez. costUsd puede
 // venir null (ej. si xAI no devolvió el dato) — en ese caso no se muestra
 // nada en vez de mostrar "$null".
+// --- categorías de una foto: una o varias -------------------------------------
+// Una foto puede pertenecer a varias categorías temáticas a la vez (una torre
+// bajo la lluvia es Arquitectura y también Blanco y Negro). El array manda:
+// `categoryKeys`. `categoryKey` se sigue escribiendo con la primera SOLO por
+// compatibilidad — alguien con el sitio abierto de antes corre el JS viejo,
+// que lee ese campo, y así ve la foto en una de sus categorías en vez de no
+// verla en ninguna. El orden del array no significa nada: no hay categoría
+// principal, fue decisión de Mario.
+function photoCategoryKeys(photo) {
+  if (Array.isArray(photo.categoryKeys)) return photo.categoryKeys;
+  return photo.categoryKey ? [photo.categoryKey] : [];
+}
+
+// Único lugar donde se escriben las categorías de una foto — así no queda
+// nunca a medias (el array nuevo sin el campo viejo, o al revés).
+function setPhotoCategories(photo, keys) {
+  if (keys && keys.length) {
+    photo.categoryKeys = keys;
+    photo.categoryKey = keys[0];
+  } else {
+    delete photo.categoryKeys;
+    delete photo.categoryKey;
+  }
+}
+
+// El país que ya se eligió para esta foto, para sesgar la búsqueda de lugares.
+// Sin esto "Santa Ana" podía caer en otro continente.
+function sessionCountryHint(siteData, session) {
+  if (session.editPhotoId) {
+    const loc = findPhotoLocation(siteData, session.editPhotoId);
+    return loc && loc.targetType === 'country' ? loc.containerName : null;
+  }
+  if (!session.target || session.target.type === 'category') return null;
+  const arr = session.target.type === 'country_new' ? siteData.visitedEmpty : siteData.visited;
+  const c = arr.find((x) => x.key === session.target.key);
+  return c ? c.name : null;
+}
+
+// Muestra los candidatos de lugar como TEXTO numerado y botones chicos con el
+// número. Metidos dentro del botón, los nombres se cortaban en el teléfono
+// justo en la parte que los distinguía; como texto el mensaje hace saltos de
+// línea y se leen enteros.
+async function sendPlaceCandidates(ctx, session, query, places) {
+  session.pendingPlaces = places;
+  await setSession(ctx.chat.id, session);
+  const lines = places.map((p, i) => `${i + 1}. ${p.shortLabel || p.displayName}`);
+  const numeros = places.map((p, i) => ({ text: String(i + 1), callback_data: `loc:${i}` }));
+  return ctx.reply(`¿Cuál de estos es "${query}"?\n\n${lines.join('\n')}`, {
+    reply_markup: {
+      inline_keyboard: [numeros, [{ text: '✖️ Ninguna de estas', callback_data: 'loc:retry' }]],
+    },
+  });
+}
+
+// Escribe la ubicación de una foto YA publicada y commitea. Es el camino que
+// faltaba: hasta ahora una coordenada mal puesta solo se arreglaba borrando la
+// foto y volviéndola a subir.
+async function commitPhotoLocation(ctx, chatId, session, loc) {
+  const { json: siteData, sha } = await getSiteData();
+  const found = findPhotoLocation(siteData, session.editPhotoId);
+  if (!found) throw new Error('Ya no encuentro esa foto.');
+  if (loc) {
+    found.photo.lat = loc.lat;
+    found.photo.lng = loc.lng;
+  } else {
+    delete found.photo.lat;
+    delete found.photo.lng;
+  }
+  await commitSiteData(siteData, sha, `✏️ Editado: ubicación de "${found.photo.caption}"`);
+  await clearSession(chatId);
+  if (!loc) return ctx.reply('✅ Le saqué la ubicación.');
+  // Se devuelve el punto en el mapa: una coordenada suelta no se puede
+  // revisar de un vistazo, un mapa sí.
+  await ctx.reply(`✅ Ubicación actualizada: ${loc.lat.toFixed(4)}, ${loc.lng.toFixed(4)}`);
+  return ctx.replyWithLocation(loc.lat, loc.lng).catch(() => {});
+}
+
+// Alterna una categoría dentro de la selección múltiple.
+function toggleKey(keys, key) {
+  return keys.includes(key) ? keys.filter((k) => k !== key) : [...keys, key];
+}
+
+// "Arquitectura + Blanco y Negro" para los resúmenes. Cadena vacía si no hay
+// ninguna — así quien la usa decide si muestra algo o no.
+function categoryNames(siteData, keys) {
+  return (keys || [])
+    .map((k) => {
+      const c = siteData.categories.find((x) => x.key === k);
+      return c ? c.name : k;
+    })
+    .join(' + ');
+}
+
+// Cronómetro por paso. Mario dijo que el bot se sentía lento sobre todo en las
+// descripciones — pero "lento" no dice DÓNDE. Esto mide cada tramo y lo
+// informa al final, igual que ya se informa el costo: optimizar sin medir es
+// como se rompe una cañería que funciona.
+async function medir(session, nombre, fn) {
+  const t0 = Date.now();
+  try {
+    return await fn();
+  } finally {
+    const ms = Date.now() - t0;
+    session.timings = session.timings || {};
+    session.timings[nombre] = (session.timings[nombre] || 0) + ms;
+  }
+}
+
+function timingNote(session) {
+  const t = session.timings;
+  if (!t) return '';
+  const partes = Object.entries(t)
+    .sort((a, b) => b[1] - a[1])
+    .map(([k, ms]) => `${k} ${(ms / 1000).toFixed(1)}s`);
+  if (!partes.length) return '';
+  const total = Object.values(t).reduce((a, b) => a + b, 0);
+  return `\n\n⏱ ${(total / 1000).toFixed(1)}s — ${partes.join(' · ')}`;
+}
+
 function costNote(costUsd) {
   return costUsd != null ? `\n\n💰 $${costUsd.toFixed(3)}` : '';
 }
@@ -309,9 +641,16 @@ function costNote(costUsd) {
 const askCountryText =
   '¿De qué país es esta foto? Escribí el nombre (si te tipeás, lo busco igual) — o "sin ubicación" si no aplica (ej. Modelos).';
 
+// Cada camino dice lo que hace de verdad. Antes el prompt empujaba al botón
+// de GPS sin aclarar que manda la posición ACTUAL — subir de noche desde el
+// hotel geolocalizaba la foto en el hotel. Y no mencionaba el mapa del clip,
+// que es el único modo de elegir un punto exacto y ya funcionaba.
 const locationPrompt =
-  '¿Dónde se sacó esta foto? Tocá el botón para compartir la ubicación, escribí el nombre del lugar ' +
-  '(ej. "Estambul" o "Torres Petronas") si no estás ahí parado, o mandá "Sin ubicación" si no la tenés.';
+  '¿Dónde se sacó esta foto?\n\n' +
+  '• Escribí el nombre del lugar — ej. "Casco Viejo" o "Torres Petronas".\n' +
+  '• O 📎 → Ubicación → arrastrá el pin al punto exacto → Enviar.\n' +
+  '• El botón de abajo manda donde estás AHORA, que no siempre es donde sacaste la foto.\n' +
+  '• O mandá "Sin ubicación".';
 
 // Reenviar una foto por file_id solo funciona si ese file_id es de tipo photo.
 // Desde que las fotos entran como ARCHIVO (ver bot.on('document')), el file_id
@@ -371,7 +710,9 @@ async function askDescription(ctx, session, lengthHint) {
 
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
-    const { suggestions, costUsd } = await suggestDescriptions(fileLink.href, title, 3, lengthHint);
+    const { suggestions, costUsd } = await medir(session, 'descripción', () =>
+      suggestDescriptions(fileLink.href, title, 3, lengthHint)
+    );
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingDescriptions = suggestions;
     session.aiCostUsd = (session.aiCostUsd || 0) + (costUsd || 0);
@@ -426,6 +767,34 @@ async function askLocation(ctx, session) {
   const total = session.fileIds.length;
   session.step = 'await_location';
   await setSession(chatId, session);
+
+  // Si la propia foto trae GPS, se ofrece PRIMERO: es el único dato que sabe
+  // dónde estaba Mario cuando disparó, y confirmarlo es un toque en vez de
+  // escribir un lugar. No se guarda solo — data.json es público y la
+  // coordenada es suya, así que la decisión sigue siendo de él.
+  if (total === 1 && session.exifGps) {
+    let nombre = null;
+    try {
+      const rev = await reverseGeocode(session.exifGps.lat, session.exifGps.lng);
+      if (rev) nombre = rev.shortLabel;
+    } catch (err) {
+      console.error('No pude nombrar el GPS del EXIF:', err.message);
+    }
+    const coords = `${session.exifGps.lat}, ${session.exifGps.lng}`;
+    return ctx.reply(
+      `📍 Esta foto trae su propia ubicación:\n${nombre ? `${nombre}\n(${coords})` : coords}\n\n¿La uso?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✅ Sí, es ahí', callback_data: 'exif:yes' }],
+            [{ text: '✍️ No, pongo otra', callback_data: 'exif:no' }],
+            [{ text: '🚫 Sin ubicación', callback_data: 'exif:none' }],
+          ],
+        },
+      }
+    );
+  }
+
   if (total > 1) {
     const label = `📍 Foto ${idx + 1} de ${total}\n`;
     return replyWithPhotoOrText(ctx, fileId, `${label}${locationPrompt}`, locationKeyboard);
@@ -455,7 +824,7 @@ async function advanceLocation(ctx, session, loc) {
 async function askIntroChoice(ctx, session, countryName) {
   const chatId = ctx.chat.id;
   try {
-    const { suggestions, costUsd } = await suggestCountryIntro(countryName, 3);
+    const { suggestions, costUsd } = await medir(session, 'intro país', () => suggestCountryIntro(countryName, 3));
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingIntros = suggestions;
     session.aiCostUsd = (session.aiCostUsd || 0) + (costUsd || 0);
@@ -550,6 +919,7 @@ bot.command('back', async (ctx) => {
     }
 
     case 'await_category_tag': {
+      delete session.categoryKeys;
       delete session.categoryKey;
       if (session.target.type === 'country_new') {
         delete session.descEs;
@@ -632,15 +1002,22 @@ async function handleIncomingFile(ctx, fileId, compressed) {
   // Solo aplica a fotos sueltas — para un álbum sería un chequeo por foto,
   // se simplifica dejándolo afuera por ahora.
   let hash = null;
+  let exifGps = null;
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
-    hash = hashBuffer(await downloadBuffer(fileLink.href));
+    const buffer = await downloadBuffer(fileLink.href);
+    hash = hashBuffer(buffer);
+    // El mismo buffer sirve para saber dónde se sacó la foto — sin una
+    // segunda descarga. Solo llega con GPS si vino como archivo: Telegram se
+    // lo arranca a las fotos comprimidas.
+    exifGps = await gpsFromBuffer(buffer);
     const existing = await findByHash(hash);
     if (existing) {
       await setSession(chatId, {
         step: 'await_duplicate_confirm',
         fileIds: [fileId],
         hash,
+        exifGps,
         hasCompressedSource: !!compressed,
       });
       return ctx.reply(
@@ -659,7 +1036,7 @@ async function handleIncomingFile(ctx, fileId, compressed) {
     console.error('Error chequeando duplicado:', err);
   }
 
-  const session = { step: 'await_country', fileIds: [fileId], hash, hasCompressedSource: !!compressed };
+  const session = { step: 'await_country', fileIds: [fileId], hash, exifGps, hasCompressedSource: !!compressed };
   if (compressed) return askLowresConfirm(ctx, session);
   await setSession(chatId, session);
   await ctx.reply(askCountryText);
@@ -734,6 +1111,12 @@ bot.on('callback_query', async (ctx) => {
   // Confirmación de /resetcontent — no depende de ninguna sesión de subida
   // en curso (de hecho, la borra), así que se resuelve ANTES del chequeo
   // de sesión de acá abajo, igual que 'cancel'.
+  if (data === 'undo:yes') {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('Deshaciendo…');
+    return performUndo(ctx);
+  }
+
   if (data === 'resetcontent:confirm') {
     await ctx.answerCbQuery();
     await ctx.editMessageText('Borrando…');
@@ -755,6 +1138,34 @@ bot.on('callback_query', async (ctx) => {
     return ctx.editMessageText('Esta conversación ya expiró — mandame la foto de nuevo.');
   }
 
+  // --- /editar: navegación del listado --------------------------------------
+  if (data === 'ed:menu') {
+    await ctx.answerCbQuery();
+    delete session.editScope;
+    return sendEditMenu(ctx, session, true);
+  }
+  if (data === 'ed:recent') {
+    await ctx.answerCbQuery();
+    session.editScope = { kind: 'recent' };
+    return sendEditPage(ctx, session, 0, true);
+  }
+  if (data.startsWith('ed:places:')) {
+    await ctx.answerCbQuery();
+    return sendPlacesPage(ctx, session, parseInt(data.slice('ed:places:'.length), 10) || 0, true);
+  }
+  if (data.startsWith('ed:pl:')) {
+    await ctx.answerCbQuery();
+    const key = data.slice('ed:pl:'.length);
+    const { json: siteData } = await getSiteData();
+    const found = collectAllPhotos(siteData).find((p) => p.placeKey === key);
+    session.editScope = { kind: 'place', key, name: found ? found.place : key };
+    return sendEditPage(ctx, session, 0, true);
+  }
+  if (data.startsWith('ed:p:')) {
+    await ctx.answerCbQuery();
+    return sendEditPage(ctx, session, parseInt(data.slice('ed:p:'.length), 10) || 0, true);
+  }
+
   // --- /editar: eligió qué foto tocar, y qué hacerle -------------------------
   if (data.startsWith('edit:sel:')) {
     const photoId = data.slice('edit:sel:'.length);
@@ -765,16 +1176,29 @@ bot.on('callback_query', async (ctx) => {
     session.editPhotoId = photoId;
     session.step = 'await_edit_action';
     await setSession(chatId, session);
-    return ctx.editMessageText(`"${loc.photo.caption}" — ${loc.containerName}\n¿Qué querés hacer?`, {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '✏️ Cambiar título', callback_data: 'edit:caption' }],
-          [{ text: '🏷 Cambiar categoría', callback_data: 'edit:category' }],
-          [{ text: '🗑 Borrar', callback_data: 'edit:delete' }],
-          [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
-        ],
-      },
-    });
+    // El encabezado dice el estado ACTUAL de la foto — categorías y
+    // ubicación. Sin esto había que adivinar qué tenía puesto antes de
+    // decidir si valía la pena tocarla.
+    const catNow = categoryNames(siteData, photoCategoryKeys(loc.photo));
+    const locNow =
+      loc.photo.lat !== undefined
+        ? `${loc.photo.lat.toFixed(4)}, ${loc.photo.lng.toFixed(4)}`
+        : 'sin ubicación propia';
+    return ctx.editMessageText(
+      `"${loc.photo.caption}" — ${loc.containerName}\n🏷 ${catNow || 'sin categoría temática'}\n🗺 ${locNow}\n\n¿Qué querés hacer?`,
+      {
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: '✏️ Cambiar título', callback_data: 'edit:caption' }],
+            [{ text: '🏷 Cambiar categoría', callback_data: 'edit:category' }],
+            [{ text: '🗺 Cambiar ubicación', callback_data: 'edit:location' }],
+            [{ text: '🗑 Borrar', callback_data: 'edit:delete' }],
+            [{ text: '↩️ Volver al listado', callback_data: 'ed:p:0' }],
+            [{ text: '✖️ Cancelar', callback_data: 'cancel' }],
+          ],
+        },
+      }
+    );
   }
 
   if (data === 'edit:caption') {
@@ -787,27 +1211,75 @@ bot.on('callback_query', async (ctx) => {
   if (data === 'edit:category') {
     await ctx.answerCbQuery();
     const { json: siteData } = await getSiteData();
-    return ctx.editMessageText('¿A qué categoría pertenece ahora?', {
-      reply_markup: categoryTagMenu(siteData, 'editcat'),
+    // Se precargan las que la foto ya tiene: si entra a la selección
+    // múltiple, arranca de lo que hay y no de cero — es donde Mario va a
+    // agregarle categorías a las fotos viejas.
+    const loc = findPhotoLocation(siteData, session.editPhotoId);
+    session.editCategoryKeys = loc ? photoCategoryKeys(loc.photo) : [];
+    await setSession(chatId, session);
+    // Antes decía "¿A qué categoría pertenece ahora?", que no dejaba claro si
+    // agregaba o reemplazaba — Mario tocó una creyendo que sumaba y en
+    // realidad pisaba la que ya tenía. Ahora se dice cuál tiene y qué hace
+    // cada camino.
+    const actuales = categoryNames(siteData, session.editCategoryKeys);
+    return ctx.editMessageText(
+      `Ahora está en: ${actuales || 'ninguna categoría temática'}.\n\n` +
+        'Tocar una la REEMPLAZA por esa. Para tener varias a la vez, usá "➕ Varias categorías".',
+      { reply_markup: categoryTagMenu(siteData, 'editcat') }
+    );
+  }
+
+  // Selección múltiple desde /editar — mismo gesto que al subir.
+  if (data === 'editcat:multi') {
+    await ctx.answerCbQuery();
+    const { json: siteData } = await getSiteData();
+    return ctx.editMessageText('Tocá todas las que correspondan, y después "Listo".', {
+      reply_markup: categoryMultiMenu(siteData, session.editCategoryKeys || [], 'editcat'),
     });
+  }
+
+  if (data.startsWith('editcat:t:')) {
+    const key = data.slice('editcat:t:'.length);
+    session.editCategoryKeys = toggleKey(session.editCategoryKeys || [], key);
+    await setSession(chatId, session);
+    const { json: siteData } = await getSiteData();
+    await ctx.answerCbQuery(categoryNames(siteData, session.editCategoryKeys) || 'Ninguna');
+    return ctx.editMessageReplyMarkup(categoryMultiMenu(siteData, session.editCategoryKeys, 'editcat'));
+  }
+
+  if (data === 'editcat:done') {
+    await ctx.answerCbQuery();
+    return commitPhotoCategories(ctx, chatId, session, session.editCategoryKeys || []);
   }
 
   if (data.startsWith('editcat:g:') || data === 'editcat:none') {
     await ctx.answerCbQuery();
     const newCategoryKey = data === 'editcat:none' ? null : data.slice('editcat:g:'.length);
-    try {
-      const { json: siteData, sha } = await getSiteData();
-      const loc = findPhotoLocation(siteData, session.editPhotoId);
-      if (!loc) throw new Error('Ya no encuentro esa foto.');
-      if (newCategoryKey) loc.photo.categoryKey = newCategoryKey;
-      else delete loc.photo.categoryKey;
-      await commitSiteData(siteData, sha, `✏️ Editado: categoría de "${loc.photo.caption}"`);
-      await clearSession(chatId);
-      return ctx.editMessageText('✅ Categoría actualizada.');
-    } catch (err) {
-      console.error('Error editando categoría:', err);
-      return ctx.editMessageText('❌ No pude actualizarlo: ' + err.message);
+    return commitPhotoCategories(ctx, chatId, session, newCategoryKey ? [newCategoryKey] : []);
+  }
+
+  // La foto traía GPS y Mario decidió qué hacer con él.
+  if (data.startsWith('exif:')) {
+    await ctx.answerCbQuery();
+    if (data === 'exif:yes') {
+      const g = session.exifGps;
+      await ctx.editMessageText(`Ubicación: ${g.lat}, ${g.lng} ✅ (la de la foto)`);
+      return advanceLocation(ctx, session, { lat: g.lat, lng: g.lng });
     }
+    if (data === 'exif:none') {
+      await ctx.editMessageText('Sin ubicación.');
+      return advanceLocation(ctx, session, null);
+    }
+    await ctx.editMessageText('Dale, poné vos la ubicación.');
+    return ctx.reply(locationPrompt, locationKeyboard);
+  }
+
+  if (data === 'edit:location') {
+    await ctx.answerCbQuery();
+    session.step = 'await_edit_location';
+    await setSession(chatId, session);
+    await ctx.editMessageText('Cambiar la ubicación de esta foto.');
+    return ctx.reply(locationPrompt, locationKeyboard);
   }
 
   if (data === 'edit:delete') {
@@ -928,10 +1400,43 @@ bot.on('callback_query', async (ctx) => {
   }
 
   // Tag opcional de categoría temática para una foto que SÍ tiene país.
+  // UN TOQUE elige y sigue, igual que siempre: este es el camino que recorre
+  // casi toda foto y no se le agregó ni una pulsación.
   if (data.startsWith('tag:g:') || data === 'tag:none') {
     await ctx.answerCbQuery();
-    session.categoryKey = data === 'tag:none' ? null : data.slice('tag:g:'.length);
-    await ctx.editMessageText(session.categoryKey ? 'Categoría marcada.' : 'Sin categoría temática.');
+    session.categoryKeys = data === 'tag:none' ? [] : [data.slice('tag:g:'.length)];
+    await ctx.editMessageText(session.categoryKeys.length ? 'Categoría marcada.' : 'Sin categoría temática.');
+    return askFinalConfirm(ctx, session);
+  }
+
+  // "➕ Varias categorías" — recién acá empieza la selección múltiple, sobre
+  // el mismo mensaje. Solo llega quien la pidió.
+  if (data === 'tag:multi') {
+    await ctx.answerCbQuery();
+    session.categoryKeys = session.categoryKeys || [];
+    await setSession(chatId, session);
+    const { json: siteData } = await getSiteData();
+    return ctx.editMessageText('Tocá todas las que correspondan, y después "Listo".', {
+      reply_markup: categoryMultiMenu(siteData, session.categoryKeys, 'tag'),
+    });
+  }
+
+  // Marcar/desmarcar una categoría. Solo se redibuja el teclado — el texto
+  // del mensaje no cambia, así que Telegram no lo hace parpadear.
+  if (data.startsWith('tag:t:')) {
+    const key = data.slice('tag:t:'.length);
+    session.categoryKeys = toggleKey(session.categoryKeys || [], key);
+    await setSession(chatId, session);
+    const { json: siteData } = await getSiteData();
+    await ctx.answerCbQuery(categoryNames(siteData, session.categoryKeys) || 'Ninguna');
+    return ctx.editMessageReplyMarkup(categoryMultiMenu(siteData, session.categoryKeys, 'tag'));
+  }
+
+  if (data === 'tag:done') {
+    await ctx.answerCbQuery();
+    const { json: siteData } = await getSiteData();
+    const names = categoryNames(siteData, session.categoryKeys);
+    await ctx.editMessageText(names ? `Categorías: ${names}.` : 'Sin categoría temática.');
     return askFinalConfirm(ctx, session);
   }
 
@@ -964,6 +1469,16 @@ bot.on('callback_query', async (ctx) => {
   }
 
   // Eligió una de las opciones de lugar que encontró el geocoding.
+  // "Ninguna de estas" caía en el parseInt de abajo, daba NaN y respondía
+  // "esa opción ya venció" — que no era lo que había pasado.
+  if (data === 'loc:retry') {
+    await ctx.answerCbQuery();
+    delete session.pendingPlaces;
+    await setSession(chatId, session);
+    await ctx.editMessageText('Dale, probemos de nuevo.');
+    return ctx.reply(locationPrompt, locationKeyboard);
+  }
+
   if (data.startsWith('loc:')) {
     const idx = parseInt(data.slice('loc:'.length), 10);
     const place = session.pendingPlaces && session.pendingPlaces[idx];
@@ -972,8 +1487,10 @@ bot.on('callback_query', async (ctx) => {
       return ctx.editMessageText('Esa opción ya venció — escribí el lugar de nuevo.');
     }
     delete session.pendingPlaces;
-    await ctx.editMessageText(`Ubicación: ${place.displayName} ✅`);
-    return advanceLocation(ctx, session, { lat: place.lat, lng: place.lng });
+    await ctx.editMessageText(`Ubicación: ${place.shortLabel || place.displayName} ✅`);
+    const punto = { lat: place.lat, lng: place.lng, label: place.shortLabel || place.displayName };
+    if (session.step === 'await_edit_location') return commitPhotoLocation(ctx, chatId, session, punto);
+    return advanceLocation(ctx, session, punto);
   }
 
   // Eligió una de las descripciones cortas que sugirió Grok, pidió otra
@@ -1130,8 +1647,11 @@ bot.on('text', async (ctx) => {
     return advanceDescription(ctx, session, text);
   }
 
-  if (session.step === 'await_location') {
-    if (text === 'Sin ubicación') return advanceLocation(ctx, session, null);
+  if (session.step === 'await_location' || session.step === 'await_edit_location') {
+    const editando = session.step === 'await_edit_location';
+    if (text === 'Sin ubicación') {
+      return editando ? commitPhotoLocation(ctx, chatId, session, null) : advanceLocation(ctx, session, null);
+    }
 
     // No es el botón de GPS ni "Sin ubicación" — probamos buscarlo como
     // nombre de lugar (geocoding) antes de rendirnos. Cubre el caso de
@@ -1140,26 +1660,26 @@ bot.on('text', async (ctx) => {
     // de aceptar la primera a ciegas — así elegís cuál es, en vez de
     // confiar en que Nominatim adivinó bien (ver bug de "/cancel").
     try {
-      const places = await geocodePlaces(text, 4);
+      const { json: siteData } = await getSiteData();
+      const hint = sessionCountryHint(siteData, session);
+      let places = await geocodePlaces(text, 4, hint);
+      // Si con el país no aparece nada, se reintenta sin él: puede ser un
+      // lugar cuyo país en OSM no es el que Mario eligió (una frontera, un
+      // nombre cargado raro). Mejor ofrecer algo lejano que no ofrecer nada.
+      if (!places.length && hint) places = await geocodePlaces(text, 4);
       if (!places.length) {
         return ctx.reply(
           `No encontré "${text}" como lugar. Probá con otro nombre (ej. "Estambul" en vez de "el puente ese"), ` +
-            'tocá "📍 Compartir ubicación", o mandá "Sin ubicación" si no aplica.',
+            'mandá el pin por 📎 → Ubicación, o "Sin ubicación" si no aplica.',
           locationKeyboard
         );
       }
-      session.pendingPlaces = places;
-      await setSession(chatId, session);
-      const rows = places.map((p, i) => [{ text: shortenPlace(p.displayName), callback_data: `loc:${i}` }]);
-      // "Ninguna de estas" en vez de 'cancel' — no querés perder la foto y el
-      // país que ya elegiste solo porque el lugar no matcheó bien.
-      rows.push([{ text: '✖️ Ninguna de estas', callback_data: 'loc:retry' }]);
-      return ctx.reply(`¿Cuál de estos es "${text}"?`, { reply_markup: { inline_keyboard: rows } });
+      return sendPlaceCandidates(ctx, session, text, places);
     } catch (err) {
       console.error('Error geocodificando:', err);
       return ctx.reply(
-        'No pude buscar ese lugar (falló el servicio de mapas) — probá de nuevo, tocá "📍 Compartir ' +
-          'ubicación", o mandá "Sin ubicación".',
+        'No pude buscar ese lugar (falló el servicio de mapas) — probá de nuevo, mandá el pin por ' +
+          '📎 → Ubicación, o "Sin ubicación".',
         locationKeyboard
       );
     }
@@ -1184,15 +1704,32 @@ bot.on('text', async (ctx) => {
 });
 
 // --- ubicación (respuesta al paso "await_location") --------------------------
-bot.on('location', async (ctx) => {
+// Un punto que llegó por Telegram — del botón de GPS, o del mapa con el pin
+// arrastrable (📎 → Ubicación), que es el único modo de elegir el lugar exacto
+// donde se sacó la foto. Los dos llegan igual acá.
+async function handleIncomingLocation(ctx, lat, lng) {
   const chatId = ctx.chat.id;
   const session = await getSession(chatId);
-  if (!session || session.step !== 'await_location') return;
+  if (!session) return;
+  if (session.step === 'await_edit_location') return commitPhotoLocation(ctx, chatId, session, { lat, lng });
+  if (session.step !== 'await_location') return;
+  return advanceLocation(ctx, session, { lat, lng });
+}
 
-  return advanceLocation(ctx, session, {
-    lat: ctx.message.location.latitude,
-    lng: ctx.message.location.longitude,
-  });
+bot.on('location', async (ctx) => {
+  return handleIncomingLocation(ctx, ctx.message.location.latitude, ctx.message.location.longitude);
+});
+
+// Si en el mapa elegís un lugar CON NOMBRE de la lista que ofrece Telegram, el
+// mensaje puede llegar como "venue" en vez de "location". Sin esto, tocabas la
+// opción más cómoda y el bot no reaccionaba: te quedabas esperando sin ningún
+// error. (Cuando el venue trae también location, lo atiende el handler de
+// arriba y este no llega a correr — no hay riesgo de guardarlo dos veces.)
+bot.on('venue', async (ctx) => {
+  const v = ctx.message.venue;
+  const loc = (v && v.location) || ctx.message.location;
+  if (!loc) return;
+  return handleIncomingLocation(ctx, loc.latitude, loc.longitude);
 });
 
 // Foto mandada "como archivo" (clip 📎 → Archivo/File) — ESTE es el único
@@ -1285,9 +1822,9 @@ async function askFinalConfirm(ctx, session) {
     const c = arr.find((x) => x.key === session.target.key);
     if (c) placeLabel = c.name;
   }
-  const tagCat = session.categoryKey ? siteData.categories.find((c) => c.key === session.categoryKey) : null;
+  const tagNames = categoryNames(siteData, session.categoryKeys);
 
-  const lines = [`📍 ${placeLabel}${tagCat ? ' + ' + tagCat.name : ''}`];
+  const lines = [`📍 ${placeLabel}${tagNames ? ' + ' + tagNames : ''}`];
   if (session.captions.length > 1) {
     lines.push(`📝 ${session.captions.length} fotos:`);
     session.captions.forEach((c, i) => lines.push(`   ${i + 1}. "${c}"`));
@@ -1295,13 +1832,26 @@ async function askFinalConfirm(ctx, session) {
     lines.push(`📝 "${session.captions[0]}"`);
   }
   if (session.locations && session.locations.some((l) => l)) {
+    // Un par de coordenadas no se revisa de un vistazo; un nombre sí. Si el
+    // punto vino de buscar un lugar ya trae su nombre puesto. Si llegó como
+    // pin del mapa o GPS, se traduce acá — solo con UNA foto: en un álbum
+    // serían varias llamadas seguidas y Nominatim limita el ritmo.
     if (session.captions.length > 1) {
       session.locations.forEach((l, i) => {
-        if (l) lines.push(`🗺 Foto ${i + 1}: ${l.lat.toFixed(4)}, ${l.lng.toFixed(4)}`);
+        if (l) lines.push(`🗺 Foto ${i + 1}: ${l.label || `${l.lat.toFixed(4)}, ${l.lng.toFixed(4)}`}`);
       });
     } else {
       const l = session.locations[0];
-      lines.push(`🗺 ${l.lat.toFixed(4)}, ${l.lng.toFixed(4)}`);
+      let nombre = l.label;
+      if (!nombre) {
+        try {
+          const rev = await reverseGeocode(l.lat, l.lng);
+          if (rev) nombre = rev.shortLabel;
+        } catch (err) {
+          console.error('No pude nombrar la coordenada:', err.message);
+        }
+      }
+      lines.push(`🗺 ${nombre ? `${nombre} (${l.lat.toFixed(4)}, ${l.lng.toFixed(4)})` : `${l.lat.toFixed(4)}, ${l.lng.toFixed(4)}`}`);
     }
   }
   if (session.descEs) lines.push(`✍️ Intro del país: "${session.descEs}"`);
@@ -1337,7 +1887,9 @@ async function finalize(ctx, session) {
     for (let i = 0; i < fileIds.length; i++) {
       const fileLink = await ctx.telegram.getFileLink(fileIds[i]);
       const publicIdHint = fileIds.length > 1 ? `${session.target.key}-${Date.now()}-${i}` : `${session.target.key}-${Date.now()}`;
-      const { cleanUrl, displayUrl, hash, buffer, width, height } = await uploadFromUrl(fileLink.href, publicIdHint);
+      const { cleanUrl, displayUrl, hash, buffer, width, height } = await medir(session, 'Cloudinary', () =>
+        uploadFromUrl(fileLink.href, publicIdHint)
+      );
       const photoId = publicIdHint;
 
       // La URL limpia (sin marca de agua) va aparte, en Redis — nunca a
@@ -1354,12 +1906,27 @@ async function finalize(ctx, session) {
       // el pedido a Prodigi según el material comprado (ver
       // cantbelievetheview-api/api/stripe-webhook.js). Si falla, no bloquea
       // la subida — el checkout cae a la foto limpia sin preparar.
-      try {
-        const printUrls = await uploadPrintDerivatives(buffer, photoId);
-        if (Object.keys(printUrls).length) await savePrintUrls(photoId, printUrls);
-      } catch (err) {
-        console.error('Error generando derivadas de impresión:', err);
-      }
+      // Las derivadas de impresión y la traducción no dependen una de otra:
+      // iban en fila sin motivo. Ahora corren juntas y el paso tarda lo que
+      // tarde la más lenta, no la suma de las dos. Cada una mantiene su
+      // propio try/catch: si falla una, la otra sigue.
+      const derivadas = medir(session, 'impresión', async () => {
+        try {
+          const printUrls = await uploadPrintDerivatives(buffer, photoId);
+          if (Object.keys(printUrls).length) await savePrintUrls(photoId, printUrls);
+        } catch (err) {
+          console.error('Error generando derivadas de impresión:', err);
+        }
+      });
+      const traduccion = medir(session, 'traducción', async () => {
+        try {
+          return await translateToEnglish(session.captions[i]);
+        } catch (err) {
+          console.error('Error traduciendo caption:', err);
+          return null;
+        }
+      });
+      const [, traducido] = await Promise.all([derivadas, traduccion]);
 
       const photoEntry = { id: photoId, displayUrl, caption: session.captions[i] };
       // Dimensiones reales del archivo subido (px) — de acá el sitio calcula
@@ -1374,13 +1941,8 @@ async function finalize(ctx, session) {
       // mostraba el título en español tal cual (nunca había campo para el
       // inglés). Si falla la traducción no bloqueamos la subida — el sitio
       // ya cae solo al español si no encuentra captionEn.
-      try {
-        const translated = await translateToEnglish(session.captions[i]);
-        if (translated.text) photoEntry.captionEn = translated.text;
-        session.aiCostUsd = (session.aiCostUsd || 0) + (translated.costUsd || 0);
-      } catch (err) {
-        console.error('Error traduciendo caption:', err);
-      }
+      if (traducido && traducido.text) photoEntry.captionEn = traducido.text;
+      if (traducido) session.aiCostUsd = (session.aiCostUsd || 0) + (traducido.costUsd || 0);
       // Solo le agregamos lat/lng a la foto si de verdad la compartiste —
       // así el sitio sabe que es una coordenada real (si no, la galería se
       // la inventa aproximada a partir del país/categoría, como ya hacía).
@@ -1395,7 +1957,7 @@ async function finalize(ctx, session) {
       // estar bajo esa categoría directamente). La galería de la categoría
       // en el sitio suma esta foto sin duplicarla en data.json (ver
       // photosForCategory en index.html).
-      if (session.categoryKey) photoEntry.categoryKey = session.categoryKey;
+      setPhotoCategories(photoEntry, session.categoryKeys);
 
       photoEntries.push(photoEntry);
       uploaded.push({ hash, photoId });
@@ -1434,12 +1996,12 @@ async function finalize(ctx, session) {
       label = c.name;
     }
 
-    const tagCat = session.categoryKey ? siteData.categories.find((c) => c.key === session.categoryKey) : null;
-    const fullLabel = tagCat ? `${label} + ${tagCat.name}` : label;
+    const tagNames = categoryNames(siteData, session.categoryKeys);
+    const fullLabel = tagNames ? `${label} + ${tagNames}` : label;
     const countLabel = photoEntries.length > 1 ? `${photoEntries.length} fotos` : `"${session.captions[0]}"`;
 
     const message = `📸 ${session.target.type === 'country_new' ? 'Nuevo país' : 'Nueva foto'}: ${countLabel} — ${fullLabel}`;
-    await commitSiteData(siteData, sha, message);
+    await medir(session, 'commit', () => commitSiteData(siteData, sha, message));
 
     // Registrar el hash de cada archivo — así, si alguna se vuelve a mandar
     // más adelante, el bot avisa antes de subirla de nuevo.
@@ -1448,6 +2010,7 @@ async function finalize(ctx, session) {
     // Para poder deshacer con /undo — qué se subió y a dónde.
     await saveLastUpload(chatId, {
       photoIds: photoEntries.map((p) => p.id),
+      captions: photoEntries.map((p) => p.caption),
       hashes: uploaded.map((u) => u.hash),
       targetType: session.target.type,
       targetKey: session.target.key,
@@ -1458,7 +2021,9 @@ async function finalize(ctx, session) {
     // con la siguiente en vez de cerrar acá — el usuario no tiene que
     // reenviar nada, sigue solo.
     if (session.albumQueue && session.albumQueue.length > 0) {
-      await ctx.reply(`✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${costNote(session.aiCostUsd)}`);
+      await ctx.reply(
+        `✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${costNote(session.aiCostUsd)}${timingNote(session)}`
+      );
       const [nextFileId, ...rest] = session.albumQueue;
       return startNextAlbumItem(ctx, chatId, nextFileId, rest, session.albumTotal);
     }
@@ -1469,7 +2034,7 @@ async function finalize(ctx, session) {
       `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${albumDone}\n` +
         `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.\n\n` +
         `(¿Te equivocaste? Mandá /undo para deshacerlo${session.albumTotal ? ' de esta última' : ''}.)` +
-        `${costNote(session.aiCostUsd)}`
+        `${costNote(session.aiCostUsd)}${timingNote(session)}`
     );
   } catch (err) {
     console.error(err);
