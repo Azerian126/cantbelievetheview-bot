@@ -19,7 +19,6 @@ const {
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces, reverseGeocode } = require('../lib/geocode');
 const { gpsFromBuffer } = require('../lib/photoExif');
-const { shrinkForVision } = require('../lib/visionImage');
 const { suggestDescriptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
 const { getRemainingCredits } = require('../lib/xaiBilling');
 
@@ -637,18 +636,38 @@ function timingNote(session) {
   return `\n\n⏱ ${(total / 1000).toFixed(1)}s — ${partes.join(' · ')}`;
 }
 
-// Un único lugar donde se anota lo que se gastó: suma a lo de esta subida y al
-// acumulado del mes, que es el número que de verdad sirve para decidir.
+// Un único lugar donde se anota lo que se gastó. El campo se inicializa
+// SIEMPRE, aunque la llamada no informe coste: con un `return` temprano el
+// campo se quedaba sin definir y la línea del resumen desaparecía entera. Un
+// contador que no se ve es peor que uno que dice cero — al menos el cero avisa
+// de que existe.
 function anotarCosto(session, costUsd) {
-  if (!costUsd) return;
-  session.aiCostUsd = (session.aiCostUsd || 0) + costUsd;
+  session.aiCostUsd = session.aiCostUsd || 0;
+  if (costUsd == null) {
+    // Se cuentan aparte las llamadas de las que no sabemos el precio, para no
+    // sumarlas como si hubieran salido gratis.
+    session.aiCostDesconocido = (session.aiCostDesconocido || 0) + 1;
+    return;
+  }
+  session.aiCostUsd += costUsd;
   addMonthlyCost(costUsd);
 }
 
-// 4 decimales y no 3: con 3, cualquier llamada por debajo de medio milésimo se
-// mostraba como $0.000, que es casi siempre.
-function costNote(costUsd) {
-  return costUsd != null ? `\n\n💰 $${costUsd.toFixed(4)}` : '';
+// Nunca inventa un número. "$0.0000" afirma que la llamada salió gratis, y eso
+// no lo sabemos: hoy xAI no está devolviendo el coste (ver el log de usage en
+// lib/grokText.js). Un hueco declarado es más útil que un cero falso.
+// El coste de UNA llamada suelta (la sugerencia que se acaba de pedir), no el
+// acumulado de la subida. Misma regla: si no se sabe, se dice.
+function costNoteOne(costUsd) {
+  return costUsd == null ? '\n\n💰 coste no informado por xAI' : `\n\n💰 $${costUsd.toFixed(4)}`;
+}
+
+function costNote(session) {
+  const sinDato = session.aiCostDesconocido || 0;
+  const gastado = session.aiCostUsd || 0;
+  if (sinDato && !gastado) return '\n\n💰 coste no informado por xAI';
+  if (sinDato) return `\n\n💰 $${gastado.toFixed(4)} (parcial — ${sinDato} llamada${sinDato > 1 ? 's' : ''} sin dato)`;
+  return `\n\n💰 $${gastado.toFixed(4)}`;
 }
 
 const askCountryText =
@@ -724,40 +743,18 @@ async function askDescription(ctx, session, lengthHint) {
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
 
-    // Se le manda a la IA una copia achicada en vez de la URL del original.
-    // Era el 46% del tiempo total de una subida, y la única espera larga en la
-    // que Mario está mirando la pantalla sin poder hacer nada.
-    // Se mide aparte para poder comparar: si achicar cuesta más de lo que
-    // ahorra, el cronómetro lo va a decir.
-    let imagen = fileLink.href;
-    try {
-      imagen = await medir(session, 'achicar', async () => {
-        const buf = await downloadBuffer(fileLink.href);
-        const { dataUrl, bytes } = await shrinkForVision(buf);
-        console.log(`Foto para la IA: ${(buf.length / 1048576).toFixed(1)}MB -> ${(bytes / 1024).toFixed(0)}KB`);
-        return dataUrl;
-      });
-    } catch (err) {
-      // Si no se puede achicar, se sigue con la URL de siempre. Perder
-      // velocidad es aceptable; perder el paso entero, no.
-      console.error('No pude achicar la foto para la IA:', err.message);
-      imagen = fileLink.href;
-    }
-
-    let suggestions, costUsd;
-    try {
-      ({ suggestions, costUsd } = await medir(session, 'descripción', () =>
-        suggestDescriptions(imagen, title, 3, lengthHint)
-      ));
-    } catch (err) {
-      // Un reintento con la URL original antes de rendirse: si el data URL no
-      // le gustara a la API, esto lo salva sin que Mario se entere.
-      if (imagen === fileLink.href) throw err;
-      console.error('Falló con la foto achicada, reintento con la original:', err.message);
-      ({ suggestions, costUsd } = await medir(session, 'descripción (reintento)', () =>
-        suggestDescriptions(fileLink.href, title, 3, lengthHint)
-      ));
-    }
+    // Se probó mandarle a la IA una copia achicada a 1000px en vez de la URL
+    // del original, con la idea de que esos 11s fueran transferencia. La
+    // medición lo desmintió: 11,0s -> 12,3s, y encima 1,0s más de achicar.
+    // Quitando el 99,9% de los bytes el tiempo no bajó, así que los 11s son el
+    // modelo razonando, no la red — lo más probable es que xAI ya reduzca las
+    // imágenes por su cuenta antes de mirarlas. Y el segundo que aparecía era
+    // la descarga de 11MB que el bot no hacía antes: la hacía xAI.
+    // Si algún día se vuelve a intentar, el margen está en pedirle MENOS al
+    // modelo, no en mandarle menos bytes.
+    const { suggestions, costUsd } = await medir(session, 'descripción', () =>
+      suggestDescriptions(fileLink.href, title, 3, lengthHint)
+    );
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingDescriptions = suggestions;
     anotarCosto(session, costUsd);
@@ -769,7 +766,7 @@ async function askDescription(ctx, session, lengthHint) {
       { text: '🔄 Más larga', callback_data: 'desc:longer' },
     ]);
     rows.push([{ text: '✏️ Escribir la mía', callback_data: 'desc:own' }]);
-    return ctx.reply(`Elegí una descripción corta o escribí la tuya:${costNote(costUsd)}`, {
+    return ctx.reply(`Elegí una descripción corta o escribí la tuya:${costNoteOne(costUsd)}`, {
       reply_markup: { inline_keyboard: rows },
     });
   } catch (err) {
@@ -878,7 +875,7 @@ async function askIntroChoice(ctx, session, countryName) {
     const rows = suggestions.map((s, i) => [{ text: s.es, callback_data: `intro:${i}` }]);
     rows.push([{ text: '✏️ Escribir la mía', callback_data: 'intro:own' }]);
     return ctx.reply(
-      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:${costNote(costUsd)}`,
+      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:${costNoteOne(costUsd)}`,
       { reply_markup: { inline_keyboard: rows } }
     );
   } catch (err) {
@@ -1635,7 +1632,7 @@ bot.on('text', async (ctx) => {
       }
       await commitSiteData(siteData, sha, `✏️ Editado: título -> "${text}"`);
       await clearSession(chatId);
-      return ctx.reply(`✅ Título actualizado.${costNote(costUsd)}`);
+      return ctx.reply(`✅ Título actualizado.${costNoteOne(costUsd)}`);
     } catch (err) {
       console.error('Error editando título:', err);
       return ctx.reply('❌ No pude actualizarlo: ' + err.message);
@@ -2067,21 +2064,23 @@ async function finalize(ctx, session) {
     // reenviar nada, sigue solo.
     if (session.albumQueue && session.albumQueue.length > 0) {
       await ctx.reply(
-        `✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${costNote(session.aiCostUsd)}${timingNote(session)}`
+        `✅ ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${costNote(session)}${timingNote(session)}`
       );
       const [nextFileId, ...rest] = session.albumQueue;
       return startNextAlbumItem(ctx, chatId, nextFileId, rest, session.albumTotal);
     }
 
     await clearSession(chatId);
+    // El acumulado se muestra SIEMPRE, aunque sea $0.00: si solo apareciera
+    // cuando hay gasto, no habría forma de saber que el contador existe.
     const mes = await getMonthlyCost();
-    const mesNota = mes ? ` (mes: $${mes.toFixed(2)})` : '';
+    const mesNota = mes == null ? ' (mes: no disponible)' : ` (mes: $${mes.toFixed(2)})`;
     const albumDone = session.albumTotal ? `\n🎉 Terminaste las ${session.albumTotal} fotos del álbum.` : '';
     await ctx.reply(
       `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${albumDone}\n` +
         `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.\n\n` +
         `(¿Te equivocaste? Mandá /undo para deshacerlo${session.albumTotal ? ' de esta última' : ''}.)` +
-        `${costNote(session.aiCostUsd)}${mesNota}${timingNote(session)}`
+        `${costNote(session)}${mesNota}${timingNote(session)}`
     );
   } catch (err) {
     console.error(err);
