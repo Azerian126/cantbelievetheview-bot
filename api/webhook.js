@@ -760,15 +760,23 @@ async function askDescription(ctx, session, lengthHint) {
     anotarCosto(session, costUsd);
     session.step = 'await_desc_choice';
     await setSession(chatId, session);
-    const rows = suggestions.map((s, i) => [{ text: s, callback_data: `desc:${i}` }]);
+    // Las descripciones van en el TEXTO del mensaje y los botones son solo el
+    // número. Telegram corta el texto de un botón, y las tres se cortaban más
+    // o menos en el mismo punto — justo el final, que es donde se diferencian.
+    // Mario elegía a ciegas la parte que no llegaba a leer. El cuerpo del
+    // mensaje no tiene ese límite. Mismo patrón que ya se usa para los
+    // candidatos de lugar (ver sendPlaceCandidates).
+    const lista = suggestions.map((sug, i) => `${i + 1}. ${sug}`).join('\n\n');
+    const rows = [suggestions.map((sug, i) => ({ text: String(i + 1), callback_data: `desc:${i}` }))];
     rows.push([
       { text: '🔄 Más corta', callback_data: 'desc:shorter' },
       { text: '🔄 Más larga', callback_data: 'desc:longer' },
     ]);
     rows.push([{ text: '✏️ Escribir la mía', callback_data: 'desc:own' }]);
-    return ctx.reply(`Elegí una descripción corta o escribí la tuya:${costNoteOne(costUsd)}`, {
-      reply_markup: { inline_keyboard: rows },
-    });
+    return ctx.reply(
+      `Elegí una descripción corta o escribí la tuya:\n\n${lista}${costNoteOne(costUsd)}`,
+      { reply_markup: { inline_keyboard: rows } }
+    );
   } catch (err) {
     console.error('Error generando descripciones:', err);
     session.step = 'await_desc';
@@ -872,10 +880,15 @@ async function askIntroChoice(ctx, session, countryName) {
     anotarCosto(session, costUsd);
     session.step = 'await_intro_choice';
     await setSession(chatId, session);
-    const rows = suggestions.map((s, i) => [{ text: s.es, callback_data: `intro:${i}` }]);
+    // Mismo defecto que las descripciones, y nadie lo había reportado todavía
+    // porque solo aparece al subir la PRIMERA foto de un país nuevo. Se
+    // arregla igual: el texto en el cuerpo y el botón solo con el número.
+    // Acá se muestran las dos versiones, que es lo que de verdad se publica.
+    const lista = suggestions.map((sug, i) => `${i + 1}. ${sug.es}\n   ${sug.en}`).join('\n\n');
+    const rows = [suggestions.map((sug, i) => ({ text: String(i + 1), callback_data: `intro:${i}` }))];
     rows.push([{ text: '✏️ Escribir la mía', callback_data: 'intro:own' }]);
     return ctx.reply(
-      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:${costNoteOne(costUsd)}`,
+      `Este país todavía no tiene galería. Elegí una intro o escribí la tuya:\n\n${lista}${costNoteOne(costUsd)}`,
       { reply_markup: { inline_keyboard: rows } }
     );
   } catch (err) {
