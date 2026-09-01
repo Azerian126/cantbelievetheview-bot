@@ -9,6 +9,8 @@ const {
   findByHash,
   saveHash,
   deleteHash,
+  addMonthlyCost,
+  getMonthlyCost,
   saveLastUpload,
   getLastUpload,
   clearLastUpload,
@@ -17,6 +19,7 @@ const {
 const { normalize, findCountryMatches, findCategoryMatch } = require('../lib/matchText');
 const { geocodePlaces, reverseGeocode } = require('../lib/geocode');
 const { gpsFromBuffer } = require('../lib/photoExif');
+const { shrinkForVision } = require('../lib/visionImage');
 const { suggestDescriptions, suggestCountryIntro, translateToEnglish } = require('../lib/grokText');
 const { getRemainingCredits } = require('../lib/xaiBilling');
 
@@ -634,8 +637,18 @@ function timingNote(session) {
   return `\n\n⏱ ${(total / 1000).toFixed(1)}s — ${partes.join(' · ')}`;
 }
 
+// Un único lugar donde se anota lo que se gastó: suma a lo de esta subida y al
+// acumulado del mes, que es el número que de verdad sirve para decidir.
+function anotarCosto(session, costUsd) {
+  if (!costUsd) return;
+  session.aiCostUsd = (session.aiCostUsd || 0) + costUsd;
+  addMonthlyCost(costUsd);
+}
+
+// 4 decimales y no 3: con 3, cualquier llamada por debajo de medio milésimo se
+// mostraba como $0.000, que es casi siempre.
 function costNote(costUsd) {
-  return costUsd != null ? `\n\n💰 $${costUsd.toFixed(3)}` : '';
+  return costUsd != null ? `\n\n💰 $${costUsd.toFixed(4)}` : '';
 }
 
 const askCountryText =
@@ -710,12 +723,44 @@ async function askDescription(ctx, session, lengthHint) {
 
   try {
     const fileLink = await ctx.telegram.getFileLink(fileId);
-    const { suggestions, costUsd } = await medir(session, 'descripción', () =>
-      suggestDescriptions(fileLink.href, title, 3, lengthHint)
-    );
+
+    // Se le manda a la IA una copia achicada en vez de la URL del original.
+    // Era el 46% del tiempo total de una subida, y la única espera larga en la
+    // que Mario está mirando la pantalla sin poder hacer nada.
+    // Se mide aparte para poder comparar: si achicar cuesta más de lo que
+    // ahorra, el cronómetro lo va a decir.
+    let imagen = fileLink.href;
+    try {
+      imagen = await medir(session, 'achicar', async () => {
+        const buf = await downloadBuffer(fileLink.href);
+        const { dataUrl, bytes } = await shrinkForVision(buf);
+        console.log(`Foto para la IA: ${(buf.length / 1048576).toFixed(1)}MB -> ${(bytes / 1024).toFixed(0)}KB`);
+        return dataUrl;
+      });
+    } catch (err) {
+      // Si no se puede achicar, se sigue con la URL de siempre. Perder
+      // velocidad es aceptable; perder el paso entero, no.
+      console.error('No pude achicar la foto para la IA:', err.message);
+      imagen = fileLink.href;
+    }
+
+    let suggestions, costUsd;
+    try {
+      ({ suggestions, costUsd } = await medir(session, 'descripción', () =>
+        suggestDescriptions(imagen, title, 3, lengthHint)
+      ));
+    } catch (err) {
+      // Un reintento con la URL original antes de rendirse: si el data URL no
+      // le gustara a la API, esto lo salva sin que Mario se entere.
+      if (imagen === fileLink.href) throw err;
+      console.error('Falló con la foto achicada, reintento con la original:', err.message);
+      ({ suggestions, costUsd } = await medir(session, 'descripción (reintento)', () =>
+        suggestDescriptions(fileLink.href, title, 3, lengthHint)
+      ));
+    }
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingDescriptions = suggestions;
-    session.aiCostUsd = (session.aiCostUsd || 0) + (costUsd || 0);
+    anotarCosto(session, costUsd);
     session.step = 'await_desc_choice';
     await setSession(chatId, session);
     const rows = suggestions.map((s, i) => [{ text: s, callback_data: `desc:${i}` }]);
@@ -827,7 +872,7 @@ async function askIntroChoice(ctx, session, countryName) {
     const { suggestions, costUsd } = await medir(session, 'intro país', () => suggestCountryIntro(countryName, 3));
     if (!suggestions.length) throw new Error('sin sugerencias');
     session.pendingIntros = suggestions;
-    session.aiCostUsd = (session.aiCostUsd || 0) + (costUsd || 0);
+    anotarCosto(session, costUsd);
     session.step = 'await_intro_choice';
     await setSession(chatId, session);
     const rows = suggestions.map((s, i) => [{ text: s.es, callback_data: `intro:${i}` }]);
@@ -1693,7 +1738,7 @@ bot.on('text', async (ctx) => {
     try {
       const translated = await translateToEnglish(text);
       session.descEn = translated.text;
-      session.aiCostUsd = (session.aiCostUsd || 0) + (translated.costUsd || 0);
+      anotarCosto(session, translated.costUsd);
     } catch (err) {
       console.error('Error traduciendo descripción de país:', err);
       session.descEn = text; // mejor mostrar el español que romper el flujo
@@ -1942,7 +1987,7 @@ async function finalize(ctx, session) {
       // inglés). Si falla la traducción no bloqueamos la subida — el sitio
       // ya cae solo al español si no encuentra captionEn.
       if (traducido && traducido.text) photoEntry.captionEn = traducido.text;
-      if (traducido) session.aiCostUsd = (session.aiCostUsd || 0) + (traducido.costUsd || 0);
+      if (traducido) anotarCosto(session, traducido.costUsd);
       // Solo le agregamos lat/lng a la foto si de verdad la compartiste —
       // así el sitio sabe que es una coordenada real (si no, la galería se
       // la inventa aproximada a partir del país/categoría, como ya hacía).
@@ -2029,12 +2074,14 @@ async function finalize(ctx, session) {
     }
 
     await clearSession(chatId);
+    const mes = await getMonthlyCost();
+    const mesNota = mes ? ` (mes: $${mes.toFixed(2)})` : '';
     const albumDone = session.albumTotal ? `\n🎉 Terminaste las ${session.albumTotal} fotos del álbum.` : '';
     await ctx.reply(
       `✅ Listo — ${countLabel} agregada${photoEntries.length > 1 ? 's' : ''} a ${fullLabel}.${albumDone}\n` +
         `Netlify va a redeployar solo, en 1-2 min debería verse en cantbelievetheview.com.\n\n` +
         `(¿Te equivocaste? Mandá /undo para deshacerlo${session.albumTotal ? ' de esta última' : ''}.)` +
-        `${costNote(session.aiCostUsd)}${timingNote(session)}`
+        `${costNote(session.aiCostUsd)}${mesNota}${timingNote(session)}`
     );
   } catch (err) {
     console.error(err);
